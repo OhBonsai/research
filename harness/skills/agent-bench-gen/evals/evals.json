@@ -1,0 +1,17 @@
+{
+  "skill_name": "agent-bench-gen",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我有一个规格文档 spec_mini.md，里面定义了 3 个测试 case（一个短任务、一个中等任务、一个长任务）。请帮我生成完整的评测套件：种子数据 + testcase YAML + README 索引。",
+      "expected_output": "生成 3 个 case 的种子数据目录（含 ground truth）、3 个 testcase YAML 文件（含 system_prompt + turns + probes + success_criteria）、README 索引文件",
+      "files": ["evals/fixtures/spec_mini.md"]
+    },
+    {
+      "id": 2,
+      "prompt": "我需要一个 Bug 根因分析的评测 case。场景是：12 个 Bug 报告，2 个隐藏根因，3 个红鲱鱼干扰。Agent 需要在 50 轮对话中完成分析。请从头生成种子数据和 testcase。",
+      "expected_output": "生成因果图种子数据（12 个 Bug 报告 + ground truth 因果关系）、1 个 testcase YAML（50 轮对话 + 4 种 probe 类型覆盖）",
+      "files": []
+    }
+  ]
+}

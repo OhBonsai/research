@@ -43,7 +43,7 @@ Codex 上下文压缩的官方 API 文档。两种实现方式：服务端压缩
 https://developers.openai.com/docs/guides/compaction
 
 **Codex CLI GitHub Repository** — OpenAI
-Codex CLI 开源代码仓库（Rust）。核心上下文管理模块位于 `codex-rs/core/src/context_manager/`（history.rs、normalize.rs、updates.rs）、`codex-rs/core/src/compact.rs`（本地压缩）、`codex-rs/core/src/compact_remote.rs`（远端压缩）。BM25 tool_search 工具搜索、中间截断输出策略、上下文增量 diff 更新机制。两阶段 Memory Pipeline（rollout extraction + global consolidation）。
+Codex CLI 开源代码仓库（Rust）。核心上下文管理模块位于 [`codex-rs/core/src/context_manager/`](https://github.com/openai/codex/tree/main/codex-rs/core/src/context_manager)（history.rs、normalize.rs、updates.rs）、[`codex-rs/core/src/compact.rs`](https://github.com/openai/codex/blob/main/codex-rs/core/src/compact.rs)（本地压缩）、[`codex-rs/core/src/compact_remote.rs`](https://github.com/openai/codex/blob/main/codex-rs/core/src/compact_remote.rs)（远端压缩）。BM25 tool_search 工具搜索、中间截断输出策略、上下文增量 diff 更新机制。两阶段 Memory Pipeline（rollout extraction + global consolidation）。
 https://github.com/openai/codex
 
 **Context Compaction Strategies: Comparative Analysis** — badlogic (GitHub Gist)
