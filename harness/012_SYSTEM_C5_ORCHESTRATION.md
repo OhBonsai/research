@@ -2,6 +2,8 @@
 
 ## §0 研究概览
 
+> **已发布配套资源**：见 [_research_c5_enhanced.md](/_research_c5_enhanced.md) 获取2025-2026年最新的扩展研究笔记（Anthropic SDK、失败模式、开源框架对比、分布式理论、Microsoft Magentic-One等）
+
 ### 核心命题
 通过分治策略将大任务拆解为多个小上下文任务，每个执行者（Agent）从干净状态开始执行，可显著降低系统复杂度、Token成本和错误级联风险，同时提升可维护性与可扩展性。
 
@@ -34,7 +36,7 @@
 #### 1.1.1 Actor Model (Hewitt 1973)
 
 **事实** [✓可验证]：
-- Actor Model由Carl Hewitt、Peter Bishop、Richard Steiger在1973年提出的论文《A Universal Modular ACTOR Formalism for Artificial Intelligence》首次系统化定义
+- Actor Model由Carl Hewitt、Peter Bishop、Richard Steiger在1973年提出的论文《[A Universal Modular ACTOR Formalism for Artificial Intelligence](https://arxiv.org/pdf/1008.1459)》首次系统化定义
 - 核心假设：每个Actor是独立计算单元，仅通过**异步消息传递**通信，不共享可变状态
 - 三种基本操作：(1) 创建新Actor；(2) 发送消息；(3) 改变内部状态
 
@@ -57,7 +59,7 @@
 #### 1.1.2 CSP (Communicating Sequential Processes - Hoare 1978)
 
 **事实** [✓可验证]：
-- Tony Hoare在1978年论文首次提出CSP，1985年出版《Communicating Sequential Processes》专著
+- Tony Hoare在1978年论文首次提出[CSP](https://en.wikipedia.org/wiki/Communicating_sequential_processes)，1985年出版《Communicating Sequential Processes》专著
 - 核心机制：多个顺序进程通过**同步通道**进行**会合通信**(rendezvous)
 - 数学形式：进程代数，允许形式化验证并发行为
 
@@ -78,7 +80,7 @@
 #### 1.1.3 MapReduce 范式与分治算法
 
 **事实** [✓可验证]：
-- Google MapReduce (2004) 采用分治范式：Map (分解) → Shuffle → Reduce (聚合)
+- Google [MapReduce](https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/) (2004) 采用分治范式：Map (分解) → Shuffle → Reduce (聚合)
 - 分治算法复杂度：T(n) = aT(n/b) + f(n) (Master定理)
 
 **对应关系**：
@@ -107,7 +109,7 @@ Combine(sol) →  Final Reduce      →  Orchestrator synthesis
 #### 1.2.1 Conway定律 (Melvin Conway 1967)
 
 **核心陈述** [事实]：
-> "设计系统的组织的通信结构与该组织所设计的系统结构必然一致"
+> "[设计系统的组织的通信结构与该组织所设计的系统结构必然一致](https://en.wikipedia.org/wiki/Conway's_law)"
 
 **逻辑推导**：
 ```
@@ -365,7 +367,7 @@ START: 有多个任务吗？
 
 ## §4 实践案例对比分析
 
-### 4.1 Claude Code Subagent
+### 4.1 [Claude Code Subagent](https://code.claude.com/docs/en/sub-agents)
 
 **架构** [事实]：
 - 单一Claude模型作为Master Orchestrator
@@ -398,7 +400,7 @@ Master: 综合三个报告生成最终建议
 
 ---
 
-### 4.2 AutoGen (Microsoft AG2)
+### 4.2 [AutoGen (Microsoft AG2)](https://arxiv.org/abs/2308.08155)
 
 **架构** [事实]：
 - 事件驱动，异步执行
@@ -434,7 +436,7 @@ Agent 3 (Executor)
 
 ---
 
-### 4.3 CrewAI
+### 4.3 [CrewAI](https://github.com/crewAIInc/crewAI)
 
 **架构** [事实]：
 - 基于role的编排（Agent = role + goal + tools）
@@ -467,7 +469,7 @@ Task {
 
 ---
 
-### 4.4 LangGraph
+### 4.4 [LangGraph](https://github.com/langchain-ai/langgraph)
 
 **架构** [事实]：
 - 基于StateGraph的DAG编排
@@ -642,7 +644,7 @@ graph.add_conditional_edges(
 
 #### 5.2.1 多Agent系统的失败率 [事实，学术文献]
 
-**研究**：*Why Do Multi-Agent LLM Systems Fail? (2025)*
+**研究**：[*Why Do Multi-Agent LLM Systems Fail? (arXiv:2503.13657, 2025)*](https://arxiv.org/abs/2503.13657)
 
 **实验对象**：7个生产框架，1642次执行跟踪
 
@@ -1361,7 +1363,1193 @@ Executor失败 =>
 
 ---
 
-## §9 开放问题与未来方向
+## §9 工程实现：算法 × Hook注入点映射与伪代码
+
+本节通过具体的Python伪代码和Hook注入点，将C5的8个核心算法与实现框架相映射。每个算法配备：
+1. **触发Hook**：何时执行
+2. **关键参数**：输入/输出数据结构
+3. **伪代码**：15-30行的核心逻辑
+4. **设计决策**：为何如此选择
+
+### 9.1 算法1：Agent生成与生命周期管理
+
+**目标**：动态创建Executor Agent，监控其状态，安全终止。
+
+**Hook注入点**：
+```
+[Plan阶段完成]
+    ↓ trigger_agent_spawning()
+[ExecutorPool创建多个Executor]
+    ↓ monitor_executor_health()
+[定期健康检查]
+    ↓ terminate_executor_on_completion()
+[Executor结果返回或超时]
+```
+
+**关键数据结构** [推导]：
+```python
+@dataclass
+class ExecutorAgent:
+    """隔离执行单元的抽象"""
+    agent_id: str              # UUID，用于追踪
+    role: str                  # "Coder" | "Analyst" | "Tester"
+    system_prompt: str         # 角色特化的指令
+    context_window: int        # Token预算
+    tools: List[str]          # 可用工具清单
+    status: str               # "pending" | "running" | "completed" | "failed"
+    created_at: datetime
+    timeout: int              # 秒数，防止无限运行
+    result: Optional[str] = None
+    error: Optional[str] = None
+```
+
+**伪代码** [事实]：
+```python
+def spawn_executor_batch(
+    plan: TaskPlan,
+    orchestrator_id: str,
+    framework: str = "claude_sdk"  # or "langgraph", "autogen"
+) -> List[ExecutorAgent]:
+    """
+    根据Plan中的任务分解，并行创建Executor Agent
+
+    设计决策：
+    - 每个Executor得到plan_i (子任务) 作为系统提示的一部分
+    - 显式设置timeout防止无限等待
+    - 在容器/进程隔离中创建 (worktree或远程环境)
+    """
+    executors = []
+
+    for task_id, task_spec in enumerate(plan.tasks):
+        # Step 1: 生成角色特化的系统提示
+        specialized_prompt = render_prompt_template(
+            template="executor_base.jinja2",
+            task_spec=task_spec,
+            role=task_spec.assigned_role,
+            constraints=task_spec.constraints
+        )
+
+        # Step 2: 分配资源预算 (Token + 计算时间)
+        token_budget = estimate_tokens(task_spec) * 1.3  # 30%缓冲
+        timeout_sec = min(300, token_budget / 100)  # 启发式：~100 token/sec
+
+        # Step 3: 创建隔离的执行环境
+        if framework == "claude_sdk":
+            executor = create_subagent(
+                name=f"executor_{task_id}",
+                system_prompt=specialized_prompt,
+                model="claude-3-5-haiku",  # 成本优化
+                tools=["bash", "file_read", "file_write"],
+                context_limit=int(token_budget)
+            )
+        elif framework == "langgraph":
+            executor = LangGraphExecutor(
+                graph=build_executor_graph(task_spec),
+                state_schema=ExecutorState
+            )
+
+        # Step 4: 包装为ExecutorAgent对象
+        agent = ExecutorAgent(
+            agent_id=f"exec_{orchestrator_id}_{task_id}",
+            role=task_spec.assigned_role,
+            system_prompt=specialized_prompt,
+            context_window=int(token_budget),
+            tools=task_spec.required_tools,
+            status="pending",
+            created_at=datetime.now(),
+            timeout=timeout_sec
+        )
+        executors.append(agent)
+
+    # Step 5: 并发启动所有Executor（关键！）
+    futures = [asyncio.create_task(start_executor(e)) for e in executors]
+    await asyncio.gather(*futures)  # 等待所有任务启动
+
+    return executors
+```
+
+**设计决策说明**：
+- **为何Haiku？**：成本/速度最优（见§5），适合单一明确任务
+- **为何Timeout？**：防止Executor进入无限循环（安全约束）
+- **为何Template？**：确保prompt一致性和可审计性（降低Agency Loss）
+
+---
+
+### 9.2 算法2：任务委派与路由
+
+**目标**：根据Task特征、当前负载、历史成功率，将Task分配给最适合的Executor。
+
+**Hook注入点**：
+```
+[Execute阶段开始]
+    ↓ route_task_to_executor()
+[Orchestrator评估Agent状态和能力匹配]
+    ↓ assign_task()
+[Task进入Executor的队列]
+```
+
+**关键参数** [推导]：
+```python
+@dataclass
+class TaskRoutingDecision:
+    """路由决策的记录"""
+    task_id: str
+    candidate_executors: List[str]  # 符合角色的Agent列表
+    scoring_factors: dict            # 各个打分维度
+    selected_executor: str           # 最终选择
+    confidence: float                # 0-1，置信度
+    fallback_executor: Optional[str] # 备选方案
+```
+
+**伪代码** [推导]：
+```python
+def route_task_to_executor(
+    task: Task,
+    available_executors: List[ExecutorAgent],
+    historical_performance: Dict[str, PerformanceMetrics]
+) -> TaskRoutingDecision:
+    """
+    使用多因素评分模型进行任务路由。
+
+    设计决策：
+    - 使用历史成功率权重（偏向经验丰富的Agent）
+    - 考虑当前负载（防止过载）
+    - 支持强制指定（若task.required_role非空）
+    """
+    candidates = []
+
+    # Step 1: 能力匹配过滤
+    for executor in available_executors:
+        if task.required_role and executor.role != task.required_role:
+            continue  # 不符合角色要求
+
+        if executor.status not in ["pending", "idle"]:
+            continue  # 忙碌中，跳过
+
+        candidates.append(executor)
+
+    if not candidates:
+        # 降级：返回任意可用的Executor（宽松匹配）
+        candidates = [e for e in available_executors if e.status == "idle"]
+
+    # Step 2: 多因素评分
+    scores = {}
+    for executor in candidates:
+        role_match_score = 1.0 if executor.role == task.required_role else 0.7
+
+        # 历史成功率权重
+        perf = historical_performance.get(executor.agent_id, PerformanceMetrics())
+        success_rate = perf.success_count / max(1, perf.total_count)
+
+        # 当前负载（Token已用 / 预算）
+        load_score = 1.0 - (perf.token_used / executor.context_window)
+
+        # 复合评分（加权和）
+        composite_score = (
+            0.4 * role_match_score +      # 角色匹配最重要
+            0.4 * success_rate +          # 历史表现次之
+            0.2 * load_score              # 当前可用容量
+        )
+        scores[executor.agent_id] = composite_score
+
+    # Step 3: 选择最高分的Executor
+    if not scores:
+        raise RuntimeError("No available executor for task")
+
+    selected_id = max(scores, key=scores.get)
+    selected_executor = next(e for e in candidates if e.agent_id == selected_id)
+    confidence = scores[selected_id]
+
+    # Step 4: 确定备选方案（用于Repair阶段）
+    sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    fallback_id = sorted_candidates[1][0] if len(sorted_candidates) > 1 else None
+
+    return TaskRoutingDecision(
+        task_id=task.id,
+        candidate_executors=[e.agent_id for e in candidates],
+        scoring_factors=scores,
+        selected_executor=selected_executor.agent_id,
+        confidence=confidence,
+        fallback_executor=fallback_id
+    )
+```
+
+**设计决策说明**：
+- **为何加权和？**：允许多维度权衡，可动态调整权重参数 (A/B测试)
+- **为何历史成功率？**：强化学习原理（多臂老虎机问题的应用）
+- **为何降级方案？**：保证任务总是能被分配（availability > optimality）
+
+---
+
+### 9.3 算法3：上下文隔离与范围限制
+
+**目标**：确保每个Executor的执行上下文是干净的、范围受限的，防止上下文污染。
+
+**Hook注入点**：
+```
+[Executor启动前]
+    ↓ initialize_isolated_context()
+[创建干净的工作目录、变量空间、工具集]
+    ↓ Executor执行Task
+[Task完成]
+    ↓ teardown_context()
+[清理临时文件、释放资源]
+```
+
+**关键数据结构** [推导]：
+```python
+@dataclass
+class IsolatedContext:
+    """Executor的隔离执行环境"""
+    workspace_id: str              # Git worktree ID or 容器ID
+    accessible_files: List[str]    # 白名单路径
+    accessible_tools: List[str]    # 可用工具清单
+    env_vars: Dict[str, str]       # 隔离的环境变量
+    memory_limit_mb: int           # 内存上限
+    token_budget: int              # Token预算
+    forbidden_patterns: List[str]  # 禁止访问的路径正则
+```
+
+**伪代码** [事实]：
+```python
+def initialize_isolated_context(
+    task: Task,
+    executor_agent: ExecutorAgent,
+    base_repo: str
+) -> IsolatedContext:
+    """
+    为Executor创建隔离的执行环境。
+
+    设计决策：
+    - 使用Git worktree (快速、自动清理)
+    - 显式白名单文件访问 (最小权限原则)
+    - 禁止访问敏感路径 (API keys, 私钥)
+    """
+
+    # Step 1: 创建隔离的工作目录
+    worktree_id = f"wt_{executor_agent.agent_id}_{task.id}"
+
+    if os.path.exists(f".git/worktrees/{worktree_id}"):
+        # 清理旧的worktree
+        subprocess.run(["git", "worktree", "prune"], check=True)
+
+    worktree_path = subprocess.run(
+        ["git", "worktree", "add", "--no-checkout", worktree_id, "HEAD"],
+        capture_output=True,
+        text=True
+    ).stdout.strip()
+
+    # Step 2: 确定可访问的文件集
+    accessible_files = []
+    for pattern in task.required_files:
+        matching = glob.glob(pattern, recursive=True)
+        accessible_files.extend(matching)
+
+    # Step 3: 构建禁止名单（安全约束）
+    forbidden_patterns = [
+        r".*\.env$",                    # 环境变量文件
+        r".*\.pem$", r".*\.key$",       # 私钥
+        r".*AWS_CREDENTIALS.*",         # AWS凭证
+        r".*/\.git/config$",            # Git配置
+        r".*node_modules.*",            # 第三方依赖 (快速失败)
+    ]
+
+    # Step 4: 生成隔离的系统提示前缀
+    context_constraint_prompt = f"""
+    [CONTEXT ISOLATION RULES]
+    - 你只能访问以下文件：{json.dumps(accessible_files[:10])}... （共{len(accessible_files)}个）
+    - 你只能使用这些工具：{', '.join(executor_agent.tools)}
+    - 禁止访问任何以下位置：{', '.join(forbidden_patterns)}
+    - 你的Token预算：{executor_agent.context_window} tokens
+    - 如果超出预算，会被强制中断
+    """
+
+    # Step 5: 注入到Executor的系统提示
+    executor_agent.system_prompt = (
+        context_constraint_prompt + "\n\n" + executor_agent.system_prompt
+    )
+
+    return IsolatedContext(
+        workspace_id=worktree_id,
+        accessible_files=accessible_files,
+        accessible_tools=executor_agent.tools,
+        env_vars={"EXECUTOR_ID": executor_agent.agent_id, "TASK_ID": task.id},
+        memory_limit_mb=2048,
+        token_budget=executor_agent.context_window,
+        forbidden_patterns=forbidden_patterns
+    )
+
+def teardown_context(context: IsolatedContext):
+    """清理隔离环境"""
+    # 删除worktree
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", context.workspace_id],
+        check=False  # 即使失败也继续
+    )
+    # 清理临时文件
+    for pattern in ["/tmp/exec_*", "/tmp/task_*"]:
+        for path in glob.glob(pattern):
+            shutil.rmtree(path, ignore_errors=True)
+```
+
+**设计决策说明**：
+- **为何Git worktree？**：自动隔离、版本控制感知、快速清理（对标Devin的沙箱）
+- **为何白名单？**：防止Agent意外访问敏感数据（PII/API keys安全）
+- **为何前缀提示？**：让LLM理解自身的约束（提升遵从度）
+
+---
+
+### 9.4 算法4：结果聚合与融合
+
+**目标**：收集多个Executor的结果，进行结构化合并、去重、冲突检测。
+
+**Hook注入点**：
+```
+[所有Executor完成或超时]
+    ↓ aggregate_results()
+[汇总结果、检测冲突]
+    ↓ resolve_conflicts()
+[融合最终答案]
+```
+
+**关键数据结构** [推导]：
+```python
+@dataclass
+class AggregatedResult:
+    """多Executor结果的融合体"""
+    task_id: str
+    executor_results: Dict[str, ExecutorOutput]  # agent_id -> output
+    merged_output: str                           # 融合后的最终结果
+    confidence_score: float                      # 0-1
+    conflicts_detected: List[str]                # 发现的冲突列表
+    consensus_aspects: List[str]                 # 达成一致的部分
+    needs_manual_review: bool                    # 是否需要人工介入
+```
+
+**伪代码** [推导]：
+```python
+def aggregate_results(
+    task: Task,
+    executor_results: Dict[str, ExecutorOutput],
+    num_executors: int
+) -> AggregatedResult:
+    """
+    聚合多个Executor的输出。
+
+    设计决策：
+    - 支持多数投票 (majority voting) 用于分类任务
+    - 支持平均 (averaging) 用于数值输出
+    - 检测显著冲突 (>30%差异)，标记需要人工审查
+    """
+
+    # Step 1: 解析所有结果
+    parsed_results = {}
+    for executor_id, output in executor_results.items():
+        try:
+            parsed = json.loads(output.content)
+            parsed_results[executor_id] = parsed
+        except json.JSONDecodeError:
+            # Fallback：原文本
+            parsed_results[executor_id] = {"raw_text": output.content}
+
+    # Step 2: 检测冲突
+    conflicts = []
+    consensus_aspects = []
+
+    if task.output_schema == "classification":
+        # 多数投票
+        predictions = [r.get("class") for r in parsed_results.values()]
+        vote_counts = Counter(predictions)
+
+        if len(vote_counts) > 1:
+            most_common, count = vote_counts.most_common(1)[0]
+            agreement_ratio = count / len(predictions)
+
+            if agreement_ratio < 0.7:  # 阈值：70%
+                conflicts.append(
+                    f"Classification disagreement: {dict(vote_counts)}, "
+                    f"agreement={agreement_ratio:.1%}"
+                )
+            else:
+                consensus_aspects.append(f"Classification: {most_common} ({agreement_ratio:.1%} agreement)")
+
+    elif task.output_schema == "numeric":
+        # 计算统计量
+        values = [float(r.get("value", 0)) for r in parsed_results.values()]
+        mean = statistics.mean(values)
+        stdev = statistics.stdev(values) if len(values) > 1 else 0
+
+        # 异常检测：超过 2σ 的值标记为异常
+        outliers = [v for v in values if abs(v - mean) > 2 * stdev]
+        if outliers:
+            conflicts.append(f"Outliers detected: {outliers}, mean={mean:.2f}, stdev={stdev:.2f}")
+        else:
+            consensus_aspects.append(f"Numeric consensus: {mean:.2f} ± {stdev:.2f}")
+
+    elif task.output_schema == "text":
+        # 文本相似度检测
+        if len(parsed_results) > 1:
+            results_list = list(parsed_results.values())
+            similarity_pairs = []
+
+            for i in range(len(results_list)):
+                for j in range(i + 1, len(results_list)):
+                    sim = difflib.SequenceMatcher(
+                        None,
+                        str(results_list[i]),
+                        str(results_list[j])
+                    ).ratio()
+                    similarity_pairs.append((i, j, sim))
+
+            avg_similarity = statistics.mean(s[2] for s in similarity_pairs)
+            if avg_similarity < 0.6:  # 阈值
+                conflicts.append(
+                    f"Text divergence: avg_similarity={avg_similarity:.1%}"
+                )
+            else:
+                consensus_aspects.append(f"Text convergence: {avg_similarity:.1%}")
+
+    # Step 3: 生成融合输出
+    if not conflicts:
+        # 没有冲突，直接合并
+        merged_output = merge_results_unanimous(parsed_results)
+        confidence_score = 0.9
+        needs_review = False
+    else:
+        # 有冲突，生成冲突报告
+        merged_output = json.dumps({
+            "status": "conflict_detected",
+            "executor_outputs": parsed_results,
+            "conflicts": conflicts,
+            "recommendation": "needs_human_review"
+        }, indent=2)
+        confidence_score = max(0, 1.0 - len(conflicts) * 0.2)
+        needs_review = True
+
+    # Step 4: 计算投票权重（准备Verifier输入）
+    executor_weights = {}
+    for executor_id in executor_results.keys():
+        # 启发式：执行时间短 + Token使用少 = 权重高
+        output = executor_results[executor_id]
+        efficiency = 1.0 / (output.execution_time_sec + output.tokens_used / 1000)
+        executor_weights[executor_id] = efficiency
+
+    return AggregatedResult(
+        task_id=task.id,
+        executor_results=executor_results,
+        merged_output=merged_output,
+        confidence_score=confidence_score,
+        conflicts_detected=conflicts,
+        consensus_aspects=consensus_aspects,
+        needs_manual_review=needs_review
+    )
+```
+
+**设计决策说明**：
+- **为何不同Schema分别处理？**：任务性质不同，聚合策略需要定制
+- **为何70%/60%阈值？**：平衡精确性与容错性（可通过A/B测试调优）
+- **为何计算权重？**：为Verifier的后续判断提供输入信息
+
+---
+
+### 9.5 算法5：失败检测与恢复
+
+**目标**：检测Executor的失败（超时、错误、幻觉），自动触发重试或升级。
+
+**Hook注入点**：
+```
+[Executor返回结果或超时]
+    ↓ detect_failure()
+[检查：输出格式、语义一致性、预期字段]
+    ↓ classify_failure_type()
+[确定失败类型：transient vs permanent]
+    ↓ execute_recovery_strategy()
+[重试 / 升级 / 人工介入]
+```
+
+**关键参数** [推导]：
+```python
+@dataclass
+class FailureDetection:
+    """失败检测的记录"""
+    executor_id: str
+    failure_type: str         # "timeout" | "format_error" | "hallucination" | "crash"
+    severity: str             # "low" | "medium" | "high" | "critical"
+    evidence: str             # 失败的具体证据
+    recovery_strategy: str    # "retry" | "escalate" | "skip" | "manual_review"
+    retry_count: int          # 已重试次数
+    max_retries: int          # 最大重试上限
+```
+
+**伪代码** [事实]：
+```python
+def detect_and_recover_failure(
+    task: Task,
+    executor_output: Optional[ExecutorOutput],
+    executor_agent: ExecutorAgent,
+    all_executors: List[ExecutorAgent],
+    global_retry_budget: int
+) -> FailureDetection:
+    """
+    检测Executor执行失败，执行恢复策略。
+
+    设计决策：
+    - 区分transient失败（可重试）vs permanent失败（应升级）
+    - 支持动态重试预算（全局限制防止级联重试）
+    - 优先级：Retry < Escalate < Manual Review
+    """
+
+    # Step 1: 初步失败检测
+    if executor_output is None:
+        failure = FailureDetection(
+            executor_id=executor_agent.agent_id,
+            failure_type="timeout",
+            severity="high",
+            evidence=f"No output within {executor_agent.timeout}s",
+            recovery_strategy="",
+            retry_count=executor_agent.retry_count or 0,
+            max_retries=3
+        )
+    else:
+        # 检查输出格式
+        try:
+            output_schema = task.output_schema
+            if output_schema == "json":
+                json.loads(executor_output.content)
+            elif output_schema == "text":
+                if not executor_output.content.strip():
+                    raise ValueError("Empty output")
+        except (json.JSONDecodeError, ValueError) as e:
+            failure = FailureDetection(
+                executor_id=executor_agent.agent_id,
+                failure_type="format_error",
+                severity="medium",
+                evidence=f"Output format mismatch: {e}",
+                recovery_strategy="",
+                retry_count=0,
+                max_retries=2
+            )
+        else:
+            # 语义一致性检查（使用另一个LLM）
+            validator_prompt = f"""
+            Check if this output solves the task correctly:
+            Task: {task.description}
+            Output: {executor_output.content[:500]}
+
+            Respond with JSON: {{"valid": bool, "issues": [str]}}
+            """
+
+            validation = call_validator_llm(validator_prompt)  # 使用Opus或Claude 3.5
+            if not validation.get("valid", False):
+                failure = FailureDetection(
+                    executor_id=executor_agent.agent_id,
+                    failure_type="hallucination",
+                    severity="high",
+                    evidence=f"Semantic validation failed: {validation.get('issues', [])}",
+                    recovery_strategy="",
+                    retry_count=0,
+                    max_retries=2
+                )
+            else:
+                # 无错误
+                return None  # Success！
+
+    # Step 2: 分类失败类型与严重程度
+    if failure.failure_type == "timeout":
+        failure.severity = "high"  # Timeout总是严重的
+        failure.recovery_strategy = "escalate" if global_retry_budget < 1000 else "retry"
+
+    elif failure.failure_type == "format_error":
+        # 可能是transient（一次性LLM错误），可重试
+        failure.severity = "medium"
+        failure.recovery_strategy = "retry" if failure.retry_count < failure.max_retries else "escalate"
+
+    elif failure.failure_type == "hallucination":
+        # 需要更强大的模型或人工介入
+        failure.severity = "high"
+        if executor_agent.model == "claude-3-5-haiku":
+            # 尝试升级到更强的模型
+            failure.recovery_strategy = "escalate"
+        else:
+            failure.recovery_strategy = "manual_review"
+
+    # Step 3: 执行恢复策略
+    if failure.recovery_strategy == "retry":
+        if failure.retry_count < failure.max_retries and global_retry_budget >= 500:
+            print(f"[RETRY] {executor_agent.agent_id}, attempt {failure.retry_count + 1}")
+            # 更新Executor以支持重试
+            executor_agent.retry_count = failure.retry_count + 1
+            # 触发重新执行（由调用者处理）
+            return failure
+
+    elif failure.recovery_strategy == "escalate":
+        print(f"[ESCALATE] {executor_agent.agent_id} to stronger model")
+        # 使用备选Executor（如果有）
+        fallback = find_fallback_executor(executor_agent, all_executors)
+        if fallback:
+            failure.evidence += f" | Escalating to {fallback.agent_id}"
+            return failure
+        else:
+            failure.recovery_strategy = "manual_review"
+
+    if failure.recovery_strategy == "manual_review":
+        print(f"[MANUAL REVIEW NEEDED] {executor_agent.agent_id}: {failure.evidence}")
+        # 标记为需要人工审查
+        failure.evidence += " | Awaiting human decision"
+
+    return failure
+```
+
+**设计决策说明**：
+- **为何区分失败类型？**：不同失败有不同的恢复成本，应差异化处理
+- **为何全局重试预算？**：防止pathological cases（某个任务反复失败导致成本爆炸）
+- **为何多层级恢复？**：Retry最廉价，Escalate中等，Manual最昂贵，按成本排序
+
+---
+
+### 9.6 算法6：Agent间通信协议
+
+**目标**：定义Orchestrator与Executor的消息格式、语义、错误处理。
+
+**Hook注入点**：
+```
+[Orchestrator → Executor]：Task Message
+[Executor处理]
+[Executor → Orchestrator]：Result Message
+[Orchestrator → Executor]：Feedback (optional)
+```
+
+**消息格式定义** [事实]：
+```python
+@dataclass
+class TaskMessage:
+    """Orchestrator → Executor 的任务消息"""
+    message_id: str                # UUID，用于追踪
+    task_id: str
+    description: str               # 任务的自然语言描述
+    constraints: Dict[str, Any]   # {"timeout": 300, "max_tokens": 8000, ...}
+    required_files: List[str]     # 必需的输入文件
+    expected_output_format: str   # "json" | "text" | "code"
+    examples: Optional[List[str]] # Few-shot示例
+    timestamp: datetime
+
+@dataclass
+class ResultMessage:
+    """Executor → Orchestrator 的结果消息"""
+    message_id: str               # 对应TaskMessage.message_id
+    executor_id: str
+    task_id: str
+    status: str                   # "success" | "partial" | "error"
+    output: str                   # 实际结果内容
+    metadata: Dict[str, Any]     # {"tokens_used": 2500, "execution_time": 12.5, ...}
+    error: Optional[str]          # 错误信息（若status != "success"）
+    timestamp: datetime
+    confidence: float             # 0-1，Executor对结果的置信度
+```
+
+**伪代码** [推导]：
+```python
+def send_task_to_executor(
+    task: Task,
+    executor: ExecutorAgent,
+    message_protocol: str = "json_rpc"  # or "openai_messages"
+) -> TaskMessage:
+    """
+    创建并发送Task消息到Executor。
+
+    设计决策：
+    - 使用JSON-RPC格式（跨框架兼容）
+    - 消息ID用于幂等性（网络重传安全）
+    - 包含例子以指导输出格式
+    """
+
+    message = TaskMessage(
+        message_id=str(uuid.uuid4()),
+        task_id=task.id,
+        description=task.description,
+        constraints={
+            "timeout": executor.timeout,
+            "max_tokens": executor.context_window,
+            "required_tools": executor.tools
+        },
+        required_files=task.required_files,
+        expected_output_format=task.output_schema,
+        examples=task.examples,
+        timestamp=datetime.now()
+    )
+
+    # 序列化为不同框架的格式
+    if message_protocol == "json_rpc":
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "execute_task",
+            "params": {
+                "message_id": message.message_id,
+                "task": asdict(task),
+                "system_prompt_override": executor.system_prompt
+            },
+            "id": message.message_id
+        }
+    elif message_protocol == "openai_messages":
+        # Claude SDK/OpenAI的messages格式
+        payload = {
+            "role": "user",
+            "content": format_task_as_prompt(message, executor)
+        }
+
+    # 发送（模拟）
+    send_message(executor, payload)
+    return message
+
+def receive_result_from_executor(
+    raw_result: Any,
+    task: Task,
+    executor: ExecutorAgent
+) -> ResultMessage:
+    """
+    解析Executor的输出为ResultMessage。
+
+    设计决策：
+    - 容忍多种输出格式（结构化 + 非结构化）
+    - 自动提取metadata（Token计数等）
+    - 对失败消息进行parsing，提取有用信息
+    """
+
+    # Step 1: 检测消息格式
+    if isinstance(raw_result, dict) and "message_id" in raw_result:
+        # 结构化返回
+        return ResultMessage(
+            message_id=raw_result.get("message_id", ""),
+            executor_id=executor.agent_id,
+            task_id=task.id,
+            status=raw_result.get("status", "partial"),
+            output=raw_result.get("output", ""),
+            metadata=raw_result.get("metadata", {}),
+            error=raw_result.get("error"),
+            timestamp=datetime.now(),
+            confidence=raw_result.get("confidence", 0.5)
+        )
+    else:
+        # 非结构化返回，包装为ResultMessage
+        return ResultMessage(
+            message_id="",
+            executor_id=executor.agent_id,
+            task_id=task.id,
+            status="partial",
+            output=str(raw_result),
+            metadata={"raw_format": True},
+            error=None,
+            timestamp=datetime.now(),
+            confidence=0.6
+        )
+```
+
+**设计决策说明**：
+- **为何JSON-RPC？**：独立于框架，支持版本化和向后兼容
+- **为何消息ID？**：支持幂等重发（分布式系统标准做法）
+- **为何Examples？**：Few-shot prompting提升输出格式一致性（指令遵从度+10-20%）
+
+---
+
+### 9.7 算法7：资源竞争管理
+
+**目标**：防止多个Executor并发修改同一文件，分配有限的Token/计算资源。
+
+**Hook注入点**：
+```
+[Executor请求文件写入权限]
+    ↓ acquire_file_lock()
+[检查是否被其他Executor持有]
+    ↓ [不持有] 授予权限
+[Executor执行修改]
+    ↓ release_file_lock()
+```
+
+**关键数据结构** [推导]：
+```python
+@dataclass
+class ResourceAllocation:
+    """单个Executor的资源配额"""
+    executor_id: str
+    token_budget_total: int        # 总预算
+    token_budget_used: int         # 已用
+    file_locks: Dict[str, Lock]    # 文件 → 锁
+    compute_time_quota_sec: int    # 计算时间预算（秒）
+    priority: int                  # 0-10，优先级（影响资源竞争时的分配）
+```
+
+**伪代码** [推导]：
+```python
+class ResourcePool:
+    """全局资源管理器"""
+
+    def __init__(self, total_token_budget: int, total_time_sec: int):
+        self.total_tokens = total_token_budget
+        self.total_time = total_time_sec
+        self.allocations: Dict[str, ResourceAllocation] = {}
+        self.file_locks: Dict[str, asyncio.Lock] = {}  # 文件路径 → 锁
+        self.global_lock = asyncio.Lock()
+
+    async def acquire_file_lock(
+        self,
+        executor_id: str,
+        file_path: str,
+        timeout_sec: float = 30.0
+    ) -> bool:
+        """
+        获取文件写入锁（互斥锁）。
+
+        设计决策：
+        - 使用互斥锁防止并发写入
+        - 支持超时，防止死锁
+        - 如果超时，生成冲突报告供Orchestrator处理
+        """
+
+        if file_path not in self.file_locks:
+            self.file_locks[file_path] = asyncio.Lock()
+
+        lock = self.file_locks[file_path]
+
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=timeout_sec)
+            print(f"[LOCK ACQUIRED] {executor_id} -> {file_path}")
+            return True
+        except asyncio.TimeoutError:
+            print(f"[LOCK TIMEOUT] {executor_id} waiting for {file_path}")
+            # 降级：允许读-修改-写，但记录冲突
+            return False
+
+    def release_file_lock(self, file_path: str, executor_id: str):
+        """释放文件锁"""
+        if file_path in self.file_locks:
+            lock = self.file_locks[file_path]
+            if lock.locked():
+                lock.release()
+                print(f"[LOCK RELEASED] {executor_id} -> {file_path}")
+
+    async def allocate_tokens(
+        self,
+        executor_id: str,
+        num_executors: int
+    ) -> int:
+        """
+        根据Executor数量均等分配Token预算。
+
+        设计决策：
+        - 基础分配：总预算 / 执行器数量
+        - 加权分配：根据priority参数调整（高优先级多分）
+        - 保留缓冲：10%预留给Verifier
+        """
+
+        async with self.global_lock:
+            # 保留缓冲
+            available_tokens = int(self.total_tokens * 0.9)
+
+            # 基础分配
+            base_allocation = available_tokens // num_executors
+
+            # 获取优先级权重
+            allocation = self.allocations.get(
+                executor_id,
+                ResourceAllocation(
+                    executor_id=executor_id,
+                    token_budget_total=base_allocation,
+                    token_budget_used=0,
+                    file_locks={},
+                    compute_time_quota_sec=self.total_time // num_executors,
+                    priority=5  # 默认中等优先级
+                )
+            )
+
+            return allocation.token_budget_total
+
+    def check_token_budget(self, executor_id: str, tokens_needed: int) -> bool:
+        """检查Executor是否有足够Token预算"""
+        allocation = self.allocations.get(executor_id)
+        if not allocation:
+            return True  # 未跟踪，允许
+
+        remaining = allocation.token_budget_total - allocation.token_budget_used
+        return remaining >= tokens_needed
+
+    def deduct_tokens(self, executor_id: str, tokens_used: int):
+        """扣除已使用的Token"""
+        if executor_id in self.allocations:
+            self.allocations[executor_id].token_budget_used += tokens_used
+```
+
+**设计决策说明**：
+- **为何互斥锁？**：防止race condition（两个Executor同时写入导致数据损坏）
+- **为何超时？**：检测死锁，自动降级而非无限等待
+- **为何Token预留？**：为Verifier/Repair阶段保留计算资源
+
+---
+
+### 9.8 算法8：编排模式选择与执行框架
+
+**目标**：根据任务特征，动态选择最优编排模式（顺序 vs 并行 vs 树形等），执行编排流程。
+
+**Hook注入点**：
+```
+[Plan阶段生成TaskGraph]
+    ↓ analyze_task_dependencies()
+[计算关键路径、并行度、通信开销]
+    ↓ select_orchestration_pattern()
+[选择最优模式]
+    ↓ execute_pattern()
+[按该模式执行]
+```
+
+**编排模式选择矩阵** [推导]：
+
+| 特征 | 顺序执行 | 并行执行 | 树形递归 | 管道 | 动态路由 |
+|-----|---------|---------|---------|------|---------|
+| 任务数 | 1-3 | 4+ | 不限 | 线性 | 不限 |
+| 依赖复杂度 | 严格串行 | 无依赖 | DAG | 阶段串行 | 动态 |
+| 通信开销 | 无 | 中 | 高 | 低 | 高 |
+| 推荐场景 | 简单任务 | 独立子任务 | 分治问题 | ETL流程 | 条件分支 |
+
+**伪代码** [事实]：
+```python
+def select_orchestration_pattern(
+    plan: TaskPlan,
+    resource_pool: ResourcePool,
+    framework: str = "claude_sdk"
+) -> Tuple[str, Dict]:
+    """
+    分析TaskGraph并选择最优编排模式。
+
+    设计决策：
+    - 使用启发式评分函数选择模式
+    - 支持用户override（通过plan.preferred_pattern）
+    - 返回模式名称和配置参数
+    """
+
+    # Step 1: 计算任务图特征
+    num_tasks = len(plan.tasks)
+
+    # 计算任务间依赖
+    dependency_graph = build_dependency_graph(plan.tasks)
+    num_edges = len(dependency_graph.edges)
+    critical_path_length = compute_critical_path(dependency_graph)
+
+    # 计算通信开销（任务输出大小和）
+    total_communication_size = sum(
+        estimate_output_size(task) for task in plan.tasks
+    )
+
+    # Step 2: 选择模式的启发式评分
+    scores = {}
+
+    # 顺序执行
+    if num_tasks <= 3 or critical_path_length == num_tasks:
+        # 任务少或完全串行依赖
+        scores["sequential"] = 1.0
+    else:
+        scores["sequential"] = 0.1
+
+    # 并行执行
+    if num_tasks > 4 and num_edges == 0:
+        # 任务多且无依赖
+        available_tokens = resource_pool.total_tokens * 0.9
+        per_task_tokens = available_tokens // num_tasks
+        if per_task_tokens > 2000:  # 足够的token
+            scores["parallel"] = 1.0
+        else:
+            scores["parallel"] = 0.3  # Token不足，降分
+    else:
+        scores["parallel"] = 0.2
+
+    # 树形递归
+    if critical_path_length >= 3 and num_tasks > 10:
+        # 深度依赖且任务多
+        scores["tree"] = 0.8
+    else:
+        scores["tree"] = 0.1
+
+    # 管道
+    if is_linear_dag(dependency_graph):
+        # 线性DAG
+        scores["pipeline"] = 0.9
+    else:
+        scores["pipeline"] = 0.2
+
+    # 动态路由
+    if num_edges > num_tasks * 0.5:  # 高度连接的图
+        scores["dynamic"] = 0.7
+    else:
+        scores["dynamic"] = 0.1
+
+    # Step 3: 选择最高分模式
+    selected_pattern = max(scores, key=scores.get)
+
+    # Step 4: 用户override
+    if plan.preferred_pattern:
+        selected_pattern = plan.preferred_pattern
+        print(f"[OVERRIDE] Using user-specified pattern: {selected_pattern}")
+
+    # Step 5: 生成模式配置
+    pattern_config = {
+        "pattern": selected_pattern,
+        "num_executors": min(num_tasks, 10),  # 限制并发数
+        "max_retry_count": 2,
+        "timeout_sec": 300,
+        "token_budget_per_executor": resource_pool.total_tokens // num_tasks,
+        "scores": scores
+    }
+
+    return selected_pattern, pattern_config
+
+async def execute_orchestration_pattern(
+    pattern: str,
+    plan: TaskPlan,
+    executors: List[ExecutorAgent],
+    resource_pool: ResourcePool,
+    pattern_config: Dict
+) -> List[AggregatedResult]:
+    """
+    根据选定的模式执行编排。
+    """
+
+    results = []
+
+    if pattern == "sequential":
+        # 逐个执行任务
+        for task in plan.tasks:
+            executor = select_executor_for_task(task, executors)
+            output = await execute_task(executor, task, resource_pool)
+            result = await aggregate_results(task, {executor.agent_id: output})
+            results.append(result)
+
+    elif pattern == "parallel":
+        # 并行执行所有任务
+        futures = []
+        for i, task in enumerate(plan.tasks):
+            executor = executors[i % len(executors)]  # 轮询分配
+            future = execute_task(executor, task, resource_pool)
+            futures.append((task, future))
+
+        # 等待所有任务完成
+        for task, future in futures:
+            output = await future
+            result = await aggregate_results(task, {})
+            results.append(result)
+
+    elif pattern == "pipeline":
+        # 流水线执行（任务按阶段串行，但阶段内并行）
+        current_stage = []
+        prev_output = None
+
+        for task in plan.tasks:
+            if prev_output:
+                task.context = prev_output  # 传递前一个任务的输出
+            current_stage.append(task)
+
+        for task in current_stage:
+            executor = select_executor_for_task(task, executors)
+            output = await execute_task(executor, task, resource_pool)
+            prev_output = output.content
+
+    elif pattern == "dynamic":
+        # 动态路由（基于执行结果动态选择下一个任务）
+        completed_tasks = set()
+
+        while len(completed_tasks) < len(plan.tasks):
+            # 找可以执行的任务（依赖已完成）
+            executable = [
+                t for t in plan.tasks
+                if t.id not in completed_tasks and
+                all(dep in completed_tasks for dep in t.dependencies)
+            ]
+
+            if not executable:
+                break
+
+            # 根据动态条件选择下一个任务
+            next_task = select_next_task_dynamically(executable, results)
+            executor = select_executor_for_task(next_task, executors)
+            output = await execute_task(executor, next_task, resource_pool)
+            completed_tasks.add(next_task.id)
+
+    return results
+```
+
+**设计决策说明**：
+- **为何启发式评分？**：精确优化NP难，启发式给出可接受解（工程实践）
+- **为何支持Override？**：某些任务的最优模式需要领域知识，用户可能比自动选择更清楚
+- **为何限制并发数？**：API rate limits / 本地资源约束下，过度并行导致反效果
+
+---
+
+### 9.9 汇总表：8个算法的Hook与触发点
+
+| # | 算法 | 主要Hook | 触发条件 | 关键输出 |
+|---|------|---------|---------|----------|
+| 1 | 生成与生命周期 | `trigger_agent_spawning()` | Plan完成 | `List[ExecutorAgent]` |
+| 2 | 任务委派 | `route_task_to_executor()` | Task ready | `TaskRoutingDecision` |
+| 3 | 上下文隔离 | `initialize_isolated_context()` | Executor启动 | `IsolatedContext` |
+| 4 | 结果聚合 | `aggregate_results()` | 所有Executor完成 | `AggregatedResult` |
+| 5 | 失败恢复 | `detect_and_recover_failure()` | 输出异常 | `FailureDetection` |
+| 6 | 通信协议 | `send_task_to_executor()` + `receive_result()` | Task发送/接收 | `TaskMessage` + `ResultMessage` |
+| 7 | 资源竞争 | `acquire_file_lock()` | 文件访问 | `bool` (locked/timeout) |
+| 8 | 模式选择 | `select_orchestration_pattern()` | Plan生成后 | `(pattern, config)` |
+
+---
+
+### 9.10 综合执行流程图
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ STAGE 1: PLAN                                           │
+├─────────────────────────────────────────────────────────┤
+│ Orchestrator分解任务 → TaskPlan                          │
+│ [9.8] select_orchestration_pattern(plan)               │
+│ [9.1] spawn_executor_batch(plan)                        │
+└──────────────┬──────────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────┐
+│ STAGE 2: EXECUTE                                        │
+├─────────────────────────────────────────────────────────┤
+│ for each task in plan.tasks:                            │
+│   [9.2] executor = route_task_to_executor(task)         │
+│   [9.3] ctx = initialize_isolated_context(task)         │
+│   [9.6] send_task_message(executor, task)               │
+│   [并行执行] executor.execute(task)                     │
+│   [9.7] resource_pool.acquire_file_lock(file)           │
+│   [9.7] resource_pool.deduct_tokens(executor_id, ...)   │
+└──────────────┬──────────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────┐
+│ STAGE 3: VERIFY & REPAIR                                │
+├─────────────────────────────────────────────────────────┤
+│ [9.6] receive_result_message(executor) → output         │
+│ [9.5] failure = detect_and_recover_failure(output)      │
+│ if failure:                                             │
+│   if failure.strategy == "retry":                       │
+│     [9.2] route_to_new_executor(task)                   │
+│     retry...                                            │
+│   elif failure.strategy == "escalate":                  │
+│     route_to_stronger_model...                          │
+│   else:                                                 │
+│     mark for manual_review                              │
+│ [9.4] agg_result = aggregate_results(all_outputs)       │
+└──────────────┬──────────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────┐
+│ STAGE 4: CLEANUP                                        │
+├─────────────────────────────────────────────────────────┤
+│ [9.7] resource_pool.release_file_lock(all_files)        │
+│ [9.3] teardown_context(isolated_ctx)                    │
+│ [9.1] terminate_executor(executor)                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## §10 开放问题与未来方向
 
 ### 9.1 理论层的未解决问题
 
@@ -1516,27 +2704,69 @@ MVP框架假设单进程内Orchestrator
 
 ## 附录 A：参考文献与数据来源
 
-### 学术文献
-1. Hewitt, C., Bishop, P., & Steiger, R. (1973). "A Universal Modular ACTOR Formalism for Artificial Intelligence." *IJCAI*. [Actor Model基础]
+### 学术文献 - 分布式系统与Actor Model
 
-2. Hoare, C. A. R. (1978). "Communicating sequential processes." *Communications of the ACM*. [CSP理论]
+1. Hewitt, C., Bishop, P., & Steiger, R. (1973). ["A Universal Modular ACTOR Formalism for Artificial Intelligence."](https://arxiv.org/pdf/1008.1459) *IJCAI*. [Actor Model基础]
 
-3. [2503.13657] "Why Do Multi-Agent LLM Systems Fail?" (2025) [失败率数据 §5.2]
+2. Hoare, C. A. R. (1978). ["Communicating sequential processes."](https://en.wikipedia.org/wiki/Communicating_sequential_processes) *Communications of the ACM*. [CSP理论]
 
-4. [2308.08155] "AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation" (Microsoft Research) [AutoGen框架]
+3. Conway, M. E. (1967). ["How do Committees Invent?"](https://en.wikipedia.org/wiki/Conway's_law) *Datamation*. [Conway定律]
 
-5. [2308.00352] "MetaGPT: Meta Programming for A Multi-Agent Collaborative Framework" (香港大学) [MetaGPT SOP编排]
+### 学术文献 - 多Agent LLM系统
+
+4. [arXiv:2503.13657] ["Why Do Multi-Agent LLM Systems Fail?"](https://arxiv.org/abs/2503.13657) (2025) - MAST失败分类法，1600+注释数据集 [失败率数据 §5.2]
+
+5. [arXiv:2509.25370] ["Where LLM Agents Fail and How They can Learn From Failures"](https://arxiv.org/abs/2509.25370) (2025) - AgentErrorTaxonomy框架
+
+6. [arXiv:2308.08155] ["AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation"](https://arxiv.org/abs/2308.08155) (Microsoft Research) [AutoGen框架]
+
+7. [arXiv:2308.00352] ["MetaGPT: Meta Programming for A Multi-Agent Collaborative Framework"](https://arxiv.org/abs/2308.00352) (香港大学) [MetaGPT SOP编排]
+
+### Anthropic官方资源
+
+8. [Building agents with the Claude Agent SDK](https://www.anthropic.com/engineering/building-agents-with-the-claude-agent-sdk) - Claude Agent SDK官方指南
+
+9. [Agent SDK Documentation](https://platform.claude.com/docs/en/agent-sdk/overview) - 官方SDK文档与subagent架构
+
+10. [Claude Code Subagents](https://code.claude.com/docs/en/sub-agents) - Subagent创建与委派策略
+
+11. [Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) - 长运行Agent的最佳实践
+
+### 开源框架与对比研究
+
+12. [Mastering AI Agent Orchestration: Comparing CrewAI, LangGraph, and OpenAI Swarm](https://medium.com/@arulprasathpackirisamy/mastering-ai-agent-orchestration-comparing-crewai-langgraph-and-openai-swarm-8164739555ff) (Arul Prasath, Medium 2026)
+
+13. [Nuvi: LangGraph vs CrewAI vs OpenAI Swarm](https://www.nuvi.dev/blog/ai-agent-framework-comparison-langgraph-crewai-openai-swarm) - 框架对比分析
+
+14. [O-Mega: Top 10 AI Agent Frameworks](https://o-mega.ai/articles/langgraph-vs-crewai-vs-autogen-top-10-agent-frameworks-2026) (2026) - 框架评测
+
+### Microsoft Magentic-One
+
+15. [Magentic-One: A Generalist Multi-Agent System](https://www.microsoft.com/en-us/research/articles/magentic-one-a-generalist-multi-agent-system-for-solving-complex-tasks/) - Microsoft Research官方发布
+
+16. [Microsoft joins multi-AI agent fray with Magentic-One](https://www.cio.com/article/3600262/microsoft-joins-multi-ai-agent-fray-with-magnetic-one.html) - CIO深度分析
+
+### Cursor与开源异步执行
+
+17. [Cursor 2.0 Revolutionizes AI Coding with Multi-Agent Architecture](https://www.artezio.com/pressroom/blog/revolutionizes-architecture-proprietary/) - Cursor 2.0多Agent设计
+
+18. [Building Autonomous Multi-Agent Systems with Cursor 2.0](https://medium.com/@abhishek97.edu/building-autonomous-multi-agent-systems-with-cursor-2-0-from-manual-to-fully-automated-04397c1831af) (Medium 2026)
+
+19. [Devin vs Cursor 2026: Autonomous Agent vs AI IDE Compared](https://www.morphllm.com/comparisons/devin-vs-cursor) - 架构对比分析
 
 ### 产业报告与工程文档
-- AWS: "Multi-LLM routing strategies for generative AI applications"
-- Anthropic: Claude Code Subagent文档
-- LangChain: LangGraph State Management指南
-- Microsoft: AutoGen v0.4 迁移指南
 
-### 行业数据
+- AWS: "Multi-LLM routing strategies for generative AI applications"
+- [LangChain: LangGraph State Management指南](https://platform.claude.com/docs/en/agent-sdk/overview)
+- Microsoft: AutoGen v0.4 迁移指南
+- [VentureBeat: Anthropic解决长运行Agent问题](https://venturebeat.com/orchestration/anthropic-says-it-solved-the-long-running-ai-agent-problem-with-a-new-multi)
+
+### 行业数据与基准
+
 - OpenRouter: 多模型成本对比
-- Langfuse: 2025多Agent框架对比
+- Langfuse: 2025多Agent框架性能对比报告
 - 生产案例：100M tokens/月的成本优化（§5.1.2）
+- VentureBeat报告：Claude Code ARR从$100M (Q4 2025)增长至$2.5B (2026年)
 
 ---
 

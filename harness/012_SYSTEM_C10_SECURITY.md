@@ -1293,6 +1293,1047 @@ C10 企业安全与责任 AI（Responsible AI）的边界在哪里？
 
 ---
 
+## §9.X 工程实现：算法×Hook注入点映射与伪代码
+
+本节将C10六大治理算法与系统架构中的Hook注入点进行映射，提供可落地的工程实现参考。
+
+### 9.X.1 核心算法与Hook架构概览
+
+**设计思路** [推导]:
+采用洋葱模型（Onion Architecture），每层Hook拦截特定的Agent行为阶段：
+```
+[User Input] → [Prompt Injection Detection] → [LLM Processing] →
+[Output Sanitization] → [Tool Selection] → [Access Control] →
+[Tool Execution] → [Audit Logging] → [User Output]
+```
+
+每个Hook点对应一类防护算法，通过@dataclass风格定义防护策略。
+
+### 9.X.2 算法1：提示注入检测 (Prompt Injection Detection)
+
+**概念** [事实]: Prompt注入是OWASP LLM Top 1，通过语义分析与嵌入对比检测恶意输入。
+
+**Hook注入点**: Agent处理用户输入前，LLM调用前
+
+**触发条件**:
+```python
+@dataclass
+class PromptInjectionDetector:
+    """提示注入检测算法 - OWASP LLM01 防御"""
+
+    # Hook配置
+    hook_trigger: str = "BEFORE_LLM_CALL"  # 在LLM处理前触发
+    sensitivity: float = 0.75  # 检测敏感度(0-1)
+
+    # 检测模型
+    detector_model: str = "meta-llama/Prompt-Guard-86M"  # 轻量级分类器
+    embedding_db: str = "vector_db"  # 已知攻击模式数据库
+```
+
+**伪代码** (15-30行):
+```python
+def detect_prompt_injection(user_input: str, context: AgentContext) -> bool:
+    """
+    使用语义检测与模式匹配识别Prompt注入
+
+    参数:
+        user_input: 用户输入
+        context: Agent上下文（历史、权限、任务）
+
+    返回:
+        True if 注入风险检测到; False otherwise
+    """
+
+    # Step 1: 生成输入嵌入 (Embedding)
+    input_embedding = embedding_model.encode(user_input)
+
+    # Step 2: 与已知攻击模式库进行相似度检查
+    # 使用向量数据库快速查询相似攻击样本
+    similar_attacks = embedding_db.query(
+        embedding=input_embedding,
+        top_k=5,
+        threshold=self.sensitivity
+    )
+
+    if similar_attacks:
+        # 检测到相似攻击
+        logger.warn(f"Potential injection detected: {user_input[:50]}...")
+        return True
+
+    # Step 3: 使用轻量级分类器再确认
+    # Llama Prompt Guard 或 NeMo Guardrails
+    injection_score = classifier.predict(user_input)
+
+    # Step 4: 检查输入中的异常令牌序列
+    # 如：过长的特殊字符序列、编码字符等
+    if check_token_anomalies(user_input):
+        logger.warn(f"Token anomalies detected in input")
+        return True
+
+    return False
+
+# Hook执行
+@hook("BEFORE_LLM_CALL")
+def on_before_llm(input_text: str, context: AgentContext):
+    if detect_prompt_injection(input_text, context):
+        raise SecurityException(
+            code="PROMPT_INJECTION_DETECTED",
+            message="Input contains suspected prompt injection",
+            severity="HIGH"
+        )
+```
+
+**设计决策** [推导]:
+1. **双重检查**: 嵌入相似度 + 分类器，提高准确率
+2. **轻量级模型**: 86M参数优先（<1s延迟），完整检测在后台异步运行
+3. **可学习**: 向量数据库动态更新，新攻击样本实时纳入
+
+### 9.X.3 算法2：输出卫生化 (Output Sanitization)
+
+**概念** [事实]: 防止LLM输出包含训练数据、系统提示、凭证等敏感信息。
+
+**Hook注入点**: LLM返回结果后，返回给用户前
+
+**触发条件**:
+```python
+@dataclass
+class OutputSanitizer:
+    """输出卫生化算法 - DLP防护"""
+
+    hook_trigger: str = "AFTER_LLM_CALL"  # 在LLM处理后触发
+
+    # 敏感信息检测
+    sensitive_patterns: List[Pattern] = field(default_factory=list)
+    # 例: API_KEY, SSN, CREDIT_CARD, PII等
+
+    redaction_strategy: str = "MASK"  # MASK|REMOVE|TRUNCATE
+```
+
+**伪代码**:
+```python
+def sanitize_llm_output(output_text: str,
+                        data_classification: DataClass,
+                        user_context: UserContext) -> str:
+    """
+    检测并清理输出中的敏感数据
+
+    参数:
+        output_text: LLM生成的原始输出
+        data_classification: 数据分级（Public/Internal/Confidential/Secret）
+        user_context: 用户权限与数据访问等级
+
+    返回:
+        Sanitized output text
+    """
+
+    sanitized = output_text
+
+    # Step 1: PII检测（个人身份信息）
+    # 使用正则 + NER(命名实体识别) 检测SSN、电子邮件、电话等
+    pii_matches = detect_pii_patterns(sanitized)
+    for match in pii_matches:
+        # 检查用户是否有权访问该PII
+        if not user_context.has_permission(match.data_type):
+            sanitized = redact_text(sanitized, match, self.redaction_strategy)
+
+    # Step 2: 凭证检测
+    # 检查API Key、数据库连接字符串、OAuth令牌等
+    credentials = detect_credentials(sanitized)
+    for cred in credentials:
+        logger.error(f"Credential exposure detected: {cred.type}")
+        sanitized = redact_text(sanitized, cred, "MASK")  # 强制遮罩
+
+    # Step 3: 数据分级一致性检查
+    # 输出中的数据敏感度不应超过用户可访问等级
+    output_classification = infer_data_sensitivity(sanitized)
+    if output_classification > user_context.max_clearance:
+        # 降低输出敏感度或直接拒绝
+        sanitized = downgrade_data_classification(
+            sanitized,
+            target_level=user_context.max_clearance
+        )
+
+    # Step 4: 审计记录
+    if sanitized != output_text:
+        audit_log.record(
+            event="OUTPUT_SANITIZED",
+            agent_id=current_agent_id(),
+            redaction_count=count_redactions(output_text, sanitized),
+            user_id=user_context.user_id
+        )
+
+    return sanitized
+
+# Hook执行
+@hook("AFTER_LLM_CALL")
+def on_after_llm(output: str, context: AgentContext) -> str:
+    user_clearance = context.user.max_data_clearance()
+    return sanitize_llm_output(output, context.data_class, context.user)
+```
+
+**设计决策** [推导]:
+1. **多层检测**: PII + 凭证 + 敏感度推断，避免单点失效
+2. **权限驱动**: 输出卫生化基于用户实际权限，而非统一规则
+3. **可审计**: 所有清理操作记录，便于合规审计
+
+### 9.X.4 算法3：访问控制强制 (Access Control Enforcement)
+
+**概念** [事实]: 在Tool执行前，基于RBAC/ABAC策略验证Agent是否有权限调用特定工具。
+
+**Hook注入点**: Agent选择工具后，实际调用前
+
+**触发条件**:
+```python
+@dataclass
+class AccessControlEnforcer:
+    """访问控制强制算法 - RBAC/ABAC"""
+
+    hook_trigger: str = "BEFORE_TOOL_EXECUTION"  # 工具调用前
+
+    # 策略引擎
+    policy_engine: PolicyEngine = field(default_factory=PolicyEngine)
+    # 支持: RBAC(Role-Based), ABAC(Attribute-Based), PBAC(Policy-Based)
+
+    enforcement_mode: str = "DENY_OVERRIDE"  # ALLOW_DEFAULT|DENY_DEFAULT
+```
+
+**伪代码**:
+```python
+def enforce_access_control(agent: Agent,
+                           tool: Tool,
+                           tool_args: Dict,
+                           context: ExecutionContext) -> bool:
+    """
+    在Tool执行前进行访问控制检查
+
+    参数:
+        agent: 请求执行的Agent
+        tool: 目标Tool
+        tool_args: Tool参数（可能包含敏感数据）
+        context: 执行上下文
+
+    返回:
+        True if 允许执行; False otherwise (将抛出异常)
+    """
+
+    # Step 1: 构建访问控制决策所需的属性
+    access_decision_input = {
+        "agent_id": agent.id,
+        "agent_type": agent.type,  # e.g., "DATA_ANALYSIS", "CODE_GEN"
+        "agent_clearance": agent.data_clearance,
+
+        "tool_id": tool.id,
+        "tool_risk_level": tool.risk_level,  # "LOW", "MEDIUM", "HIGH", "CRITICAL"
+        "tool_required_clearance": tool.requires_clearance,
+
+        "tenant_id": context.tenant_id,
+        "request_timestamp": context.timestamp,
+        "tool_args_sensitivity": infer_sensitivity(tool_args),  # 参数的敏感性
+    }
+
+    # Step 2: 查询Policy Engine（支持RBAC/ABAC）
+    # RBAC示例: Agent with role="ANALYST" can call tool="QUERY_DB" in tenant="ACME"
+    # ABAC示例: if agent.clearance >= tool.required_clearance
+    #           and tool.risk_level <= agent.risk_tolerance: ALLOW
+
+    policy_decision = policy_engine.evaluate(
+        subject=agent,
+        action="EXECUTE_TOOL",
+        resource=tool,
+        environment=access_decision_input
+    )
+
+    if policy_decision.decision == "DENY":
+        logger.warn(
+            f"Access denied: {agent.id} -> {tool.id}. "
+            f"Reason: {policy_decision.reason}"
+        )
+        return False
+
+    # Step 3: 进一步的数据级访问控制
+    # 检查tool参数中的数据访问是否符合权限
+    for arg_name, arg_value in tool_args.items():
+        if is_database_reference(arg_value):
+            db_clearance = infer_db_sensitivity(arg_value)
+            if db_clearance > agent.data_clearance:
+                logger.error(
+                    f"Agent {agent.id} lacks clearance for DB: {arg_value}"
+                )
+                return False
+
+    # Step 4: 冲突检测（Conflict of Interest, 伦理墙）
+    # 检查Agent之前是否访问过该工具的竞争对手数据
+    if tool.category == "COMPETITIVE_INTELLIGENCE":
+        conflicts = check_coi(agent.previous_accesses, tool.target_companies)
+        if conflicts:
+            logger.warn(f"Conflict of interest detected: {conflicts}")
+            return False
+
+    # Step 5: 审计记录决策
+    audit_log.record(
+        event="ACCESS_CONTROL_CHECK",
+        agent_id=agent.id,
+        tool_id=tool.id,
+        decision="ALLOW",
+        policy_applied=policy_decision.policy_id
+    )
+
+    return True
+
+# Hook执行
+@hook("BEFORE_TOOL_EXECUTION")
+def on_before_tool_execution(agent: Agent, tool: Tool,
+                              tool_args: Dict, context: ExecutionContext):
+    if not enforce_access_control(agent, tool, tool_args, context):
+        raise AccessDeniedException(
+            agent_id=agent.id,
+            tool_id=tool.id,
+            reason="Policy violation"
+        )
+```
+
+**设计决策** [推导]:
+1. **多层验证**: Agent权限 + 工具风险等级 + 数据敏感度
+2. **冲突检测**: 伦理墙作为高级访问控制
+3. **可扩展策略**: 支持RBAC到ABAC的平滑升级
+
+### 9.X.5 算法4：审计日志 (Audit Logging)
+
+**概念** [事实]: 不可修改的安全事件日志，用于事后调查和合规证明。
+
+**Hook注入点**: 所有关键操作点（LLM调用、工具执行、权限变更、数据访问）
+
+**触发条件**:
+```python
+@dataclass
+class ImmutableAuditLog:
+    """审计日志算法 - 合规与事后调查"""
+
+    hook_trigger: str = "ON_EVERY_CRITICAL_EVENT"
+
+    # 存储
+    backend: str = "APPEND_ONLY"  # 仅追加，不可修改
+    # 后端选项: 数据库事务日志, Blockchain, 云存储WORM
+
+    # 日志完整性
+    use_merkle_tree: bool = True  # 防止篡改
+    retention_days: int = 2555  # 7年（合规标准）
+```
+
+**伪代码**:
+```python
+def audit_log_event(event: AuditEvent) -> str:
+    """
+    记录不可修改的审计事件
+
+    参数:
+        event: 审计事件对象
+
+    返回:
+        Event log ID (for traceability)
+    """
+
+    # Step 1: 事件规范化与完整信息收集
+    canonical_event = {
+        "timestamp": utc_now_iso8601(),
+        "event_type": event.type,  # "TOOL_EXECUTION", "DATA_ACCESS", etc.
+        "agent_id": event.agent_id,
+        "user_id": event.user_id,
+        "tenant_id": event.tenant_id,
+        "resource": event.resource,
+        "action": event.action,
+        "result": event.result,  # "SUCCESS", "FAILURE", "DENIED"
+        "ip_address": event.client_ip,
+        "session_id": event.session_id,
+    }
+
+    # Step 2: 计算事件的加密哈希（与前一条日志链接）
+    prev_hash = audit_store.get_last_hash()
+    current_hash = sha256(
+        json.dumps(canonical_event) + prev_hash
+    )
+
+    # Step 3: 将事件写入不可修改存储
+    # 使用事务日志或WORM（Write Once Read Many）存储
+    log_entry = {
+        **canonical_event,
+        "hash": current_hash,
+        "prev_hash": prev_hash,  # 链式关联，防止篡改
+    }
+
+    log_id = audit_store.append(log_entry)
+
+    # Step 4: 针对敏感事件的即时警告
+    if event.severity == "CRITICAL":
+        alert_security_team(
+            message=f"Critical security event: {event.type}",
+            event_id=log_id,
+            details=canonical_event
+        )
+
+    # Step 5: 返回日志ID供追踪
+    return log_id
+
+# Hook执行 - 多点插入
+@hook("AFTER_LLM_CALL")
+def on_llm_completion(input_text: str, output_text: str, context: AgentContext):
+    audit_log_event(AuditEvent(
+        type="LLM_CALL",
+        agent_id=context.agent_id,
+        action="PROCESS_TEXT",
+        result="SUCCESS",
+        resource=f"model:{context.model_name}"
+    ))
+
+@hook("BEFORE_TOOL_EXECUTION")
+def on_tool_start(tool: Tool, tool_args: Dict, context: AgentContext):
+    audit_log_event(AuditEvent(
+        type="TOOL_EXECUTION_START",
+        agent_id=context.agent_id,
+        action=f"CALL:{tool.id}",
+        resource=tool.id
+    ))
+
+@hook("AFTER_TOOL_EXECUTION")
+def on_tool_completion(tool: Tool, result: Any, context: AgentContext):
+    audit_log_event(AuditEvent(
+        type="TOOL_EXECUTION_COMPLETE",
+        agent_id=context.agent_id,
+        action=f"CALL:{tool.id}",
+        result="SUCCESS",
+        resource=tool.id
+    ))
+```
+
+**设计决策** [推导]:
+1. **链式哈希**: 每条日志关联前一条，任何篡改都能被检测
+2. **多点覆盖**: 覆盖完整Agent生命周期
+3. **合规7年保留**: 满足SOC2/ISO 27001规定
+
+### 9.X.6 算法5：数据丢失防御 (Data Loss Prevention)
+
+**概念** [事实]: 在Agent I/O中检测并阻止敏感数据（PII、商业秘密、凭证）的泄露。
+
+**Hook注入点**: 工具调用参数检查、输出返回前
+
+**触发条件**:
+```python
+@dataclass
+class DataLossPrevention:
+    """DLP算法 - 敏感信息泄露防护"""
+
+    hook_trigger: str = "BEFORE_TOOL_ARGS_VALIDATION|AFTER_LLM_CALL"
+
+    # 检测方式
+    detection_method: str = "PATTERN|SEMANTIC"
+    # 可组合: 正则模式 + 语义NER + 分类器
+
+    # 数据分类
+    sensitive_data_types: List[str] = field(default_factory=lambda: [
+        "CREDIT_CARD", "SSN", "API_KEY", "DB_PASSWORD",
+        "MEDICAL_RECORD", "TRADE_SECRET", "CUSTOMER_LIST"
+    ])
+```
+
+**伪代码**:
+```python
+def detect_and_prevent_data_loss(content: str,
+                                  direction: str,  # "INPUT"|"OUTPUT"
+                                  context: AgentContext) -> Dict:
+    """
+    检测内容中的敏感数据，返回检测结果与建议行动
+
+    参数:
+        content: 要检查的文本
+        direction: 数据流向（输入或输出）
+        context: Agent执行上下文
+
+    返回:
+        {
+            "has_sensitive_data": bool,
+            "detected_items": List[SensitiveDataItem],
+            "action": "ALLOW"|"REDACT"|"BLOCK",
+            "reason": str
+        }
+    """
+
+    detected_items = []
+
+    # Step 1: 正则模式匹配（快速，低误报）
+    # 检测API Key、信用卡、SSN等高度结构化数据
+    for pattern_name, pattern in sensitive_patterns.items():
+        matches = pattern.findall(content)
+        if matches:
+            detected_items.append({
+                "type": pattern_name,
+                "count": len(matches),
+                "confidence": 0.95  # 正则通常高精度
+            })
+
+    # Step 2: NER（命名实体识别）识别个人信息
+    # 使用spaCy或transformer-based NER
+    entities = ner_model(content)
+    for entity in entities:
+        if entity.label in ["PERSON", "ORG", "EMAIL"]:
+            # 进一步判断是否真正敏感（例：公开的CEO名字可能不敏感）
+            if is_truly_sensitive(entity, context):
+                detected_items.append({
+                    "type": f"NER_{entity.label}",
+                    "value": entity.text,
+                    "confidence": entity.confidence
+                })
+
+    # Step 3: 分类器判断（语义level的敏感性）
+    # 使用微调的分类器判断整个文本的敏感度
+    content_sensitivity_score = dlp_classifier.predict(content)
+
+    if content_sensitivity_score > 0.7:
+        detected_items.append({
+            "type": "HIGH_SENSITIVITY_CONTENT",
+            "score": content_sensitivity_score,
+            "confidence": 0.8
+        })
+
+    # Step 4: 决策
+    has_sensitive = len(detected_items) > 0
+
+    if not has_sensitive:
+        return {
+            "has_sensitive_data": False,
+            "detected_items": [],
+            "action": "ALLOW",
+            "reason": "No sensitive data detected"
+        }
+
+    # 敏感数据发现的处理策略
+    if direction == "OUTPUT":
+        # 输出包含敏感数据 - 更严格
+        if context.user.max_data_clearance() < infer_sensitivity(content):
+            return {
+                "has_sensitive_data": True,
+                "detected_items": detected_items,
+                "action": "BLOCK",  # 直接阻止
+                "reason": "User lacks clearance for this data"
+            }
+        else:
+            return {
+                "has_sensitive_data": True,
+                "detected_items": detected_items,
+                "action": "REDACT",  # 清理但允许
+                "reason": "Sensitive data detected; will be redacted"
+            }
+
+    elif direction == "INPUT":
+        # 输入包含敏感数据 - 判断Agent是否需要访问
+        if tool_requires_this_data(context.current_tool, detected_items):
+            return {
+                "has_sensitive_data": True,
+                "detected_items": detected_items,
+                "action": "ALLOW",
+                "reason": "Tool requires this sensitive data"
+            }
+        else:
+            return {
+                "has_sensitive_data": True,
+                "detected_items": detected_items,
+                "action": "BLOCK",
+                "reason": "Tool does not require sensitive data"
+            }
+
+    # Step 5: 审计敏感数据访问
+    audit_log_event(AuditEvent(
+        type="DLP_CHECK",
+        agent_id=context.agent_id,
+        action=f"DLP_CHECK_{direction}",
+        result="DETECTED" if has_sensitive else "CLEAR",
+        details=detected_items
+    ))
+
+    return {
+        "has_sensitive_data": has_sensitive,
+        "detected_items": detected_items,
+        "action": "ALLOW",
+        "reason": "Data cleared by DLP"
+    }
+
+# Hook执行
+@hook("BEFORE_TOOL_EXECUTION")
+def on_tool_args_dlp_check(tool: Tool, tool_args: Dict, context: AgentContext):
+    # 检查输入参数
+    for arg_name, arg_value in tool_args.items():
+        if isinstance(arg_value, str):
+            result = detect_and_prevent_data_loss(arg_value, "INPUT", context)
+            if result["action"] == "BLOCK":
+                raise DataLeakageException(
+                    message=f"Sensitive data in tool argument: {arg_name}",
+                    detected_items=result["detected_items"]
+                )
+
+@hook("AFTER_LLM_CALL")
+def on_llm_output_dlp_check(output: str, context: AgentContext):
+    result = detect_and_prevent_data_loss(output, "OUTPUT", context)
+    if result["action"] == "BLOCK":
+        raise DataLeakageException(
+            message="Output contains unauthorized sensitive data",
+            detected_items=result["detected_items"]
+        )
+    elif result["action"] == "REDACT":
+        # 输出会被清理（由OutputSanitizer处理）
+        pass
+```
+
+**设计决策** [推导]:
+1. **多层检测**: 模式 + NER + 分类器，逐层提高准确率
+2. **方向敏感**: 输入输出的处理策略不同
+3. **权限驱动**: 基于用户权限判断数据是否应被传递
+
+### 9.X.7 算法6：速率限制与滥用检测 (Rate Limiting & Abuse Detection)
+
+**概念** [推导]: 防止单个Agent或用户消耗过多资源，检测异常的使用模式。
+
+**Hook注入点**: 工具执行前（限制频率）、执行后（检测异常）
+
+**触发条件**:
+```python
+@dataclass
+class RateLimitingEngine:
+    """速率限制与滥用检测"""
+
+    hook_trigger: str = "BEFORE_TOOL_EXECUTION|PERIODIC_MONITORING"
+
+    # 限流策略
+    rate_limits: Dict[str, int] = field(default_factory=lambda: {
+        "agent_calls_per_minute": 60,
+        "api_calls_per_day": 10000,
+        "concurrent_executions": 10,
+    })
+
+    # 检测窗口
+    detection_window_minutes: int = 5
+```
+
+**伪代码**:
+```python
+def check_rate_limit_and_abuse(agent: Agent,
+                                tool: Tool,
+                                context: ExecutionContext) -> bool:
+    """
+    在工具执行前进行速率限制与滥用检测
+
+    参数:
+        agent: 请求的Agent
+        tool: 目标工具
+        context: 执行上下文
+
+    返回:
+        True if 允许执行; False otherwise (触发限流)
+    """
+
+    agent_id = agent.id
+    tenant_id = context.tenant_id
+    now = utc_now()
+
+    # Step 1: 检查Agent在时间窗口内的调用频率
+    rate_limit_key = f"agent:{agent_id}:calls"
+    call_count = rate_limiter.get_count(rate_limit_key, window="1min")
+
+    if call_count >= self.rate_limits["agent_calls_per_minute"]:
+        logger.warn(f"Agent {agent_id} rate limit exceeded (1min)")
+        return False
+
+    # Step 2: 检查单个用户/租户的API使用量
+    tenant_key = f"tenant:{tenant_id}:api_calls"
+    daily_calls = rate_limiter.get_count(tenant_key, window="24h")
+
+    if daily_calls >= self.rate_limits["api_calls_per_day"]:
+        logger.warn(f"Tenant {tenant_id} daily API limit exceeded")
+        return False
+
+    # Step 3: 检查并发执行数（防止资源耗尽）
+    concurrent_key = f"agent:{agent_id}:concurrent"
+    concurrent_count = rate_limiter.get_count(concurrent_key)
+
+    if concurrent_count >= self.rate_limits["concurrent_executions"]:
+        logger.warn(f"Agent {agent_id} concurrent execution limit exceeded")
+        return False
+
+    # Step 4: 异常模式检测（ML-based）
+    # 检测不符合Agent历史行为的调用
+    recent_calls = metrics_db.query(
+        agent_id=agent_id,
+        timerange=(now - 5*60, now)  # 过去5分钟
+    )
+
+    anomaly_score = compute_anomaly_score(recent_calls)
+
+    if anomaly_score > 0.8:
+        # 例：Agent突然从1call/min跳到100call/min，高度异常
+        logger.error(f"Anomalous behavior detected: Agent {agent_id}, score={anomaly_score}")
+
+        # 进一步调查：是否是受损的Agent？
+        if should_trigger_emergency_review(agent_id, anomaly_score):
+            trigger_incident_response(agent_id, "POTENTIAL_COMPROMISE")
+
+        return False
+
+    # Step 5: 成功时，递增计数器
+    rate_limiter.increment(rate_limit_key, ttl=60)
+    rate_limiter.increment(tenant_key, ttl=86400)
+    rate_limiter.increment(concurrent_key, ttl=execution_timeout)
+
+    return True
+
+# Hook执行
+@hook("BEFORE_TOOL_EXECUTION")
+def on_rate_limit_check(agent: Agent, tool: Tool, context: ExecutionContext):
+    if not check_rate_limit_and_abuse(agent, tool, context):
+        raise RateLimitException(
+            agent_id=agent.id,
+            reason="Rate limit exceeded or suspicious activity detected"
+        )
+```
+
+**设计决策** [推导]:
+1. **多维度限流**: 按Agent、Tenant、全局分级
+2. **异常检测**: 基于历史行为的ML异常检测
+3. **可调参数**: 不同Agent类型可有不同限流阈值
+
+### 9.X.8 算法7：安全凭证管理 (Secure Credential Management)
+
+**概念** [事实]: 在Agent运行时注入必要的凭证（DB密码、API密钥），避免其暴露给LLM或日志。
+
+**Hook注入点**: 工具初始化时（注入凭证）、工具完成后（清理凭证）
+
+**触发条件**:
+```python
+@dataclass
+class SecureCredentialManager:
+    """安全凭证管理算法"""
+
+    hook_trigger: str = "BEFORE_TOOL_EXECUTION|AFTER_TOOL_EXECUTION"
+
+    # 凭证存储
+    vault: str = "HASHICORP_VAULT"  # 凭证金库
+
+    # 凭证隔离
+    inject_method: str = "ENVIRONMENT_VARIABLES"  # 不通过CLI参数或日志
+    cleanup_on_exit: bool = True  # 工具结束后立即清理
+```
+
+**伪代码**:
+```python
+def inject_credentials_safely(tool: Tool,
+                               agent: Agent,
+                               context: ExecutionContext) -> Dict[str, str]:
+    """
+    为Tool注入必要的凭证，返回环境变量字典
+
+    参数:
+        tool: 目标工具
+        agent: 请求的Agent
+        context: 执行上下文
+
+    返回:
+        env_vars: 凭证以环境变量形式（不在args中）
+    """
+
+    env_vars = {}
+
+    # Step 1: 确定Tool需要的凭证
+    required_creds = tool.required_credentials
+    # 例：["DATABASE_PASSWORD", "AWS_ACCESS_KEY"]
+
+    if not required_creds:
+        return env_vars
+
+    # Step 2: 检查Agent是否有权获得这些凭证
+    agent_permissions = agent.get_credential_permissions()
+
+    for cred_name in required_creds:
+        if cred_name not in agent_permissions:
+            raise UnauthorizedCredentialAccessException(
+                agent_id=agent.id,
+                credential=cred_name,
+                reason="Agent lacks permission"
+            )
+
+    # Step 3: 从安全凭证库（如HashiCorp Vault）获取凭证
+    # 不应在日志、CLI、代码中暴露凭证
+
+    for cred_name in required_creds:
+        try:
+            credential_value = vault.get_secret(
+                path=f"agent-credentials/{context.tenant_id}/{cred_name}",
+                access_token=context.vault_token  # OAuth token for vault access
+            )
+
+            # Step 4: 以环境变量形式注入（Tool通过os.getenv读取）
+            # 而非CLI参数（避免暴露在Process列表或日志中）
+            env_key = f"{cred_name}_INJECTED"  # 特殊标记
+            env_vars[env_key] = credential_value
+
+            # 审计凭证访问
+            audit_log_event(AuditEvent(
+                type="CREDENTIAL_ACCESS",
+                agent_id=agent.id,
+                action=f"RETRIEVE:{cred_name}",
+                resource="VAULT",
+                result="SUCCESS"
+            ))
+
+        except VaultException as e:
+            logger.error(f"Failed to retrieve credential {cred_name}: {e}")
+            raise CredentialRetrievalException(
+                credential=cred_name,
+                reason=str(e)
+            )
+
+    return env_vars
+
+def cleanup_credentials_after_execution(env_vars: Dict[str, str],
+                                        agent_id: str):
+    """
+    工具执行后清理环境中的凭证
+    """
+
+    # Step 1: 从内存中删除凭证变量
+    for key in list(env_vars.keys()):
+        if "INJECTED" in key:
+            # 清除值（避免内存dump可读）
+            env_vars[key] = None
+            del env_vars[key]
+
+    # Step 2: 如果凭证被缓存，也要清理
+    credential_cache.clear_for_agent(agent_id)
+
+    # Step 3: 审计清理事件
+    audit_log_event(AuditEvent(
+        type="CREDENTIAL_CLEANUP",
+        agent_id=agent_id,
+        action="CLEANUP_ENVIRONMENT",
+        result="SUCCESS"
+    ))
+
+# Hook执行
+@hook("BEFORE_TOOL_EXECUTION")
+def on_tool_execution_inject_creds(tool: Tool, agent: Agent, context: ExecutionContext):
+    env_vars = inject_credentials_safely(tool, agent, context)
+    context.environment_variables.update(env_vars)
+    context.cleanup_credentials_flag = True  # 标记需要清理
+
+@hook("AFTER_TOOL_EXECUTION")
+def on_tool_execution_cleanup_creds(context: ExecutionContext):
+    if context.cleanup_credentials_flag:
+        cleanup_credentials_after_execution(
+            context.environment_variables,
+            context.agent_id
+        )
+```
+
+**设计决策** [推导]:
+1. **Vault集成**: 凭证从不硬编码或暴露，使用HashiCorp Vault等管理
+2. **环境变量注入**: 避免CLI参数或日志暴露
+3. **生命周期清理**: 执行完立即清理内存中的凭证
+
+### 9.X.9 算法8：合规政策引擎 (Compliance Policy Engine)
+
+**概念** [推导]: 运行时强制监管约束（GDPR数据驻留、行业合规等）。
+
+**伪代码**:
+```python
+def enforce_compliance_policies(operation: Operation,
+                                 context: ExecutionContext) -> bool:
+    """
+    在工具执行前强制合规政策
+
+    参数:
+        operation: 待执行的操作（数据查询、数据传输等）
+        context: 执行上下文（租户、位置、数据分类等）
+
+    返回:
+        True if 符合合规; False otherwise
+    """
+
+    # Step 1: 确定适用的合规框架
+    applicable_frameworks = determine_applicable_frameworks(
+        tenant_id=context.tenant_id,
+        data_location=operation.data_location
+    )
+    # 例: ["GDPR", "CCPA", "SOC2"]
+
+    # Step 2: 针对每个框架，执行合规检查
+    for framework in applicable_frameworks:
+
+        if framework == "GDPR":
+            # GDPR特定检查
+            if not check_gdpr_residency(operation, context):
+                logger.error("GDPR data residency violation")
+                return False
+
+            if not check_gdpr_consent(operation, context):
+                logger.error("GDPR consent violation")
+                return False
+
+        elif framework == "CCPA":
+            # CCPA特定检查
+            if not check_ccpa_deletion_request(operation, context):
+                logger.error("CCPA deletion request violation")
+                return False
+
+        elif framework == "SOC2":
+            # SOC2特定检查（访问控制、审计）
+            # SOC2检查在其他Hook中处理，这里仅做meta检查
+            pass
+
+    # Step 3: 审计合规检查
+    audit_log_event(AuditEvent(
+        type="COMPLIANCE_CHECK",
+        frameworks=applicable_frameworks,
+        operation=operation.id,
+        result="COMPLIANT"
+    ))
+
+    return True
+
+# Hook执行
+@hook("BEFORE_TOOL_EXECUTION")
+def on_compliance_enforcement(operation: Operation, context: ExecutionContext):
+    if not enforce_compliance_policies(operation, context):
+        raise ComplianceViolationException(
+            operation_id=operation.id,
+            reason="Compliance policy violation"
+        )
+```
+
+---
+
+### 9.X.10 Hook与算法映射总表
+
+| # | 算法 | Hook点 | 触发时机 | 关键效果 | 成本 |
+|---|------|--------|---------|---------|------|
+| 1 | Prompt注入检测 | BEFORE_LLM_CALL | 用户输入处理前 | 防止攻击指令注入 | 低 |
+| 2 | 输出卫生化 | AFTER_LLM_CALL | LLM返回后 | 防止敏感数据泄露 | 中 |
+| 3 | 访问控制 | BEFORE_TOOL_EXECUTION | 工具调用前 | 强制权限隔离 | 中 |
+| 4 | 审计日志 | ON_CRITICAL_EVENT | 所有关键点 | 事后调查与合规证明 | 低-中 |
+| 5 | DLP检测 | BEFORE_TOOL_ARGS / AFTER_LLM | 参数验证、输出检查 | 防止PII/凭证泄露 | 高 |
+| 6 | 速率限制 | BEFORE_TOOL_EXECUTION | 工具执行前 | 防止资源耗尽与滥用 | 低 |
+| 7 | 凭证管理 | BEFORE_TOOL / AFTER_TOOL | 工具生命周期 | 凭证隔离与清理 | 中 |
+| 8 | 合规引擎 | BEFORE_TOOL_EXECUTION | 工具执行前 | 监管约束强制 | 中-高 |
+
+### 9.X.11 完整执行流与数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      User Input                                 │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                    HOOK 1
+                         ▼
+        ┌─────────────────────────────────┐
+        │  Prompt Injection Detection     │
+        │  (NER + Pattern + Classifier)   │
+        └────┬────────────────────────────┘
+             │
+        [PASS] │ [FAIL] ──► REJECT
+             │
+             ▼
+    ┌─────────────────────────────────┐
+    │  LLM Processing                 │
+    │  (Claude / GPT-4 / etc.)        │
+    └────┬────────────────────────────┘
+         │
+    HOOK 2 (LLM Output)
+         ▼
+    ┌──────────────────────────┐
+    │  Output Sanitization     │
+    │  (DLP + PII detection)   │
+    └────┬─────────────────────┘
+         │
+    [CLEAN] │ [DIRTY] ──► REDACT/BLOCK
+         │
+         ▼
+    ┌──────────────────────────┐
+    │  Tool Selection          │
+    │  (Agent Plans Next Step) │
+    └────┬─────────────────────┘
+         │
+    HOOK 3 (Before Tool Execution)
+         ▼
+    ┌──────────────────────────────────────┐
+    │  Access Control Check                │
+    │  ├─ Agent Permission                 │
+    │  ├─ Tool Risk Level                  │
+    │  ├─ Data Sensitivity                 │
+    │  └─ Conflict of Interest              │
+    └────┬──────────────────────────────────┘
+         │
+    [ALLOW] │ [DENY] ──► BLOCK
+         │
+    HOOK 6 & 4 (Parallel)
+         ├─────────────────────────────────┐
+         ▼                                   ▼
+    Rate Limit Check              Credential Injection
+    ├─ Per-Agent Limit            └─ Vault Integration
+    ├─ Per-Tenant Limit              Environment Vars
+    └─ Anomaly Detection             Secure Cleanup
+         │                                   │
+         ▼                                   ▼
+    ┌──────────────────────────────────────┐
+    │  Tool Execution                      │
+    │  (Database Query / API Call / etc.)  │
+    └────┬───────────────────────────────────┘
+         │
+    HOOK 5 (DLP on Tool Args & Output)
+         ▼
+    ┌──────────────────────────┐
+    │  Data Loss Prevention     │
+    │  (Pattern + NER)          │
+    └────┬─────────────────────┘
+         │
+    [SAFE] │ [LEAK DETECTED] ──► BLOCK
+         │
+         ▼
+    ┌──────────────────────────┐
+    │  Credential Cleanup       │
+    │  (Delete from Memory)     │
+    └────┬─────────────────────┘
+         │
+    HOOK 4 & 8 (Logging & Compliance)
+         ├──────────────────────────────────┐
+         ▼                                   ▼
+    Immutable Audit Log         Compliance Check
+    ├─ Event Type                ├─ GDPR Residency
+    ├─ Agent/User/Tenant         ├─ CCPA Deletion
+    ├─ Resource & Action         └─ SOC2 Controls
+    └─ Hash Chain
+         │
+         ▼
+    ┌──────────────────────────┐
+    │  Output to User          │
+    │  (Sanitized & Compliant) │
+    └──────────────────────────┘
+```
+
+### 9.X.12 实施顺序与优先级
+
+**Phase 1 (Week 1-4): 基础检测**
+- Hook 1: Prompt注入检测（LlamaGuard）
+- Hook 4: 审计日志（append-only）
+- Hook 6: 基础速率限制
+
+**Phase 2 (Week 5-8): 访问控制**
+- Hook 3: RBAC访问控制
+- Hook 7: 凭证管理
+- Hook 2: 输出卫生化（基础）
+
+**Phase 3 (Week 9-12): 高级防护**
+- Hook 5: DLP（多层检测）
+- Hook 2: 输出卫生化（增强）
+- Hook 6: 异常检测（ML-based）
+- Hook 8: 合规引擎
+
+---
+
 ## §10 建议与实施路线图
 
 ### 10.1 企业 Agent 治理的实施阶段
@@ -1335,43 +2376,112 @@ C10 企业安全与责任 AI（Responsible AI）的边界在哪里？
 ### 理论框架
 - [NIST SP 800-207: Zero Trust Architecture](https://csrc.nist.gov/pubs/sp/800/207/final)
 - [NIST SP 800-207A: Multi-Cloud Environments](https://csrc.nist.gov/pubs/sp/800/207/a/final)
-- Bell-LaPadula Model (Wikipedia)
-- Saltzer & Schroeder (1975): The Protection of Information in Computer Systems
-- Brewer-Nash Model / Chinese Wall (1989)
+- [NIST AI Risk Management Framework](https://www.nist.gov/itl/ai-risk-management-framework)
+- [Bell-LaPadula Model on Wikipedia](https://en.wikipedia.org/wiki/Bell–LaPadula_model)
+- [Saltzer & Schroeder (1975): The Protection of Information in Computer Systems](https://www.cs.virginia.edu/~evans/cs551/saltzer/)
+- [Brewer-Nash Model / Chinese Wall (1989)](https://en.wikipedia.org/wiki/Chinese_wall_(computer_security))
 
-### 产品与实践
+### Anthropic Claude Code 架构与防御
+- [Making Claude Code More Secure and Autonomous - Anthropic](https://www.anthropic.com/engineering/claude-code-sandboxing)
+- [Claude Code Sandbox Guide: Setup, Config & Security (2026)](https://claudefa.st/blog/guide/sandboxing-guide)
+- [Sandboxing - Claude Code Documentation](https://code.claude.com/docs/en/sandboxing)
+- [Claude Code Security: Enterprise-Grade AI Coding Safety](https://desinance.com/ai/gen-ai/claude-code-security/)
+- [GitHub: Claude Code System Prompts](https://github.com/Piebald-AI/claude-code-system-prompts)
+
+### Prompt 注入攻击与防御研究
+- [Claude AI Prompt Injection Vulnerability - Oasis Security](https://www.oasis.security/blog/claude-ai-prompt-injection-data-exfiltration-vulnerability)
+- [GitHub: CVE-2025-54794 Claude AI Prompt Injection Analysis](https://github.com/AdityaBhatt3010/CVE-2025-54794-Hijacking-Claude-AI-with-a-Prompt-Injection-The-Jailbreak-That-Talked-Back)
+- [Prompt Injection Attacks on Agentic Coding Assistants - arXiv 2601.17548](https://arxiv.org/html/2601.17548v1)
+
+### OWASP Top 10 for LLM Applications 2025
+- [OWASP LLM01:2025 Prompt Injection](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)
+- [OWASP Top 10 for LLMs 2025 PDF](https://owasp.org/www-project-top-10-for-large-language-model-applications/assets/PDF/OWASP-Top-10-for-LLMs-v2025.pdf)
+- [OWASP Top 10 LLM 2025: Examples & Mitigation - Oligo Security](https://www.oligo.security/academy/owasp-top-10-llm-updated-2025-examples-and-mitigation-strategies)
+- [OWASP Top 10 for LLM Applications 2025: Prompt Injection - Checkpoint](https://www.checkpoint.com/cyber-hub/what-is-llm-security/prompt-injection/)
+- [OWASP Top 10 for LLMs 2025 - DeepTeam](https://www.trydeepteam.com/docs/frameworks-owasp-top-10-for-llms)
+
+### 零信任与AI Agent安全框架 (2025-2026)
+- [Architecting Trust: NIST-Based Security Governance for AI Agents - Microsoft](https://techcommunity.microsoft.com/blog/microsoftdefendercloudblog/architecting-trust-a-nist-based-security-governance-framework-for-ai-agents/4490556)
+- [AAGATE: A Governance Platform for Agentic AI - CSA](https://cloudsecurityalliance.org/blog/2025/12/22/aagate-a-nist-ai-rmf-aligned-governance-platform-for-agentic-ai)
+- [The Agentic Trust Framework: Zero Trust for AI Agents - CSA Feb 2026](https://cloudsecurityalliance.org/blog/2026/02/02/the-agentic-trust-framework-zero-trust-governance-for-ai-agents)
+- [A Look at New AI Control Frameworks from NIST & CSA](https://cloudsecurityalliance.org/blog/2025/09/03/a-look-at-the-new-ai-control-frameworks-from-nist-and-csa)
+- [Security for AI Agents: Protecting Intelligent Systems in 2025 - Obsidian Security](https://www.obsidiansecurity.com/blog/security-for-ai-agents)
+- [Zero Trust Has a Blind Spot—Your AI Agents - Bleeping Computer](https://www.bleepingcomputer.com/news/security/zero-trust-has-a-blind-spot-your-ai-agents/)
+
+### 企业产品与实践
 - [Microsoft Secure Agentic AI Framework (Agent 365)](https://www.microsoft.com/en-us/security/blog/2026/03/09/secure-agentic-ai-for-your-frontier-transformation/)
 - [AWS Bedrock Guardrails](https://aws.amazon.com/bedrock/guardrails/)
 - [Azure AI Content Safety](https://azure.microsoft.com/en-us/products/ai-services/ai-content-safety/)
-- [Model Context Protocol Security](https://modelcontextprotocol.io/specification/draft/basic/security_best_practices)
+- [Model Context Protocol Security Best Practices](https://modelcontextprotocol.io/specification/draft/basic/security_best_practices)
+
+### 开源防护工具生态
+- [GitHub: NVIDIA-NeMo/Guardrails](https://github.com/NVIDIA-NeMo/Guardrails)
+- [NeMo Guardrails: Ultimate Open-Source LLM Security Toolkit - Towards Data Science](https://towardsdatascience.com/nemo-guardrails-the-ultimate-open-source-llm-security-toolkit-0a34648713ef)
+- [Meta Llama Prompt Guard 2 Documentation](https://www.llama.com/docs/model-cards-and-prompt-formats/prompt-guard/)
+- [Meta Llama Prompt Guard on Hugging Face](https://huggingface.co/meta-llama/Prompt-Guard-86M)
+- [GitHub: Guardrails AI - Detect Prompt Injection Validator](https://github.com/guardrails-ai/detect_prompt_injection)
+- [LlamaFirewall: Open Source Guardrail System - arXiv 2505.03574](https://arxiv.org/pdf/2505.03574)
+- [GitHub: Prompt Injection Defenses Collection](https://github.com/tldrsec/prompt-injection-defenses)
+- [SENTINEL Platform: Complete AI Security Toolkit 2026](https://dev.to/dmitry_labintcev_9e611e04/sentinel-platform-complete-ai-security-toolkit-2026-update-log-ca7)
+- [Practical AI Guardrails: Types, Tools & Detection - Tredence](https://www.tredence.com/blog/ai-guardrails-types-tools-detection)
+
+### 对抗性攻击与防御研究 (2024-2025)
+- [PROACTIVE DEFENSE AGAINST LLM JAILBREAK - arXiv 2510.05052](https://arxiv.org/pdf/2510.05052)
+- [SecurityLingua: Efficient Defense of LLM Jailbreak - arXiv 2506.12707](https://arxiv.org/pdf/2506.12707)
+- [Defending LLMs Against Jailbreak via In-Decoding Safety - arXiv 2601.10543](https://arxiv.org/html/2601.10543v1)
+- [AutoDefense: Multi-Agent LLM Defense - arXiv 2403.04783](https://arxiv.org/pdf/2403.04783)
+- [Short-length Adversarial Training for Long-length Defense - arXiv 2502.04204](https://arxiv.org/html/2502.04204)
+- [TeleAI-Safety: Comprehensive LLM Jailbreaking Benchmark - arXiv 2512.05485](https://arxiv.org/pdf/2512.05485)
+- [CS598 JY2: Topics in LLM Agents - OpenReview](https://openreview.net/pdf?id=DHe0UXipKU)
+
+### Model Context Protocol (MCP) 安全与授权 (2025)
+- [MCP Specs Update: June 2025 Auth - Auth0](https://auth0.com/blog/mcp-specs-update-all-about-auth/)
+- [One Year of MCP: November 2025 Release - MCP Blog](https://blog.modelcontextprotocol.io/posts/2025-11-25-first-mcp-anniversary/)
+- [MCP Authorization: Securing with Fine-Grained Access Control - Cerbos](https://www.cerbos.dev/blog/mcp-authorization)
+- [Client Registration & Enterprise Management in MCP - Aaron Parecki](https://aaronparecki.com/2025/11/25/1/mcp-authorization-spec-update)
+- [MCP's Next Phase: Inside November 2025 Specification - Medium](https://medium.com/@dave-patten/mcps-next-phase-inside-the-november-2025-specification-49f298502b03)
+- [Model Context Protocol: Understanding Security Risks - Red Hat](https://www.redhat.com/en/blog/model-context-protocol-mcp-understanding-security-risks-and-controls)
+- [Is that allowed? Authentication in MCP - Stack Overflow Blog](https://stackoverflow.blog/2026/01/21/is-that-allowed-authentication-and-authorization-in-model-context-protocol/)
 
 ### DLP 与数据保护
 - [Lakera: Data Loss Prevention for GenAI](https://www.lakera.ai/blog/data-loss-prevention)
 - [Strac: ChatGPT DLP](https://www.strac.io/blog/chatgpt-dlp-data-loss-prevention)
+- [Langfuse: Security & Guardrails](https://langfuse.com/docs/security-and-guardrails)
 
 ### 影子 AI 与治理
 - [Okta Shadow AI Discovery](https://www.okta.com/newsroom/press-releases/okta-secures-the-agentic-enterprise-with-new-tools-for-discovering-and-mitigating-shadow-ai-risks/)
 - [ISACA: The Rise of Shadow AI (2025)](https://www.isaca.org/resources/news-and-trends/industry-news/2025/the-rise-of-shadow-ai-auditing-unauthorized-ai-tools-in-the-enterprise)
-- [Gartner: Shadow AI & Enterprise Risk]
 
 ### 身份管理与认证
 - [OpenID Connect for Agents (OIDC-A)](https://subramanya.ai/2025/04/28/oidc-a-proposal/)
 - [Auth0: MCP + OIDC Integration](https://auth0.com/blog/mcp-and-auth0-an-agentic-match-made-in-heaven/)
 - [WorkOS: OAuth/OIDC for AI Agents (2025)](https://workos.com/blog/best-oauth-oidc-providers-for-authenticating-ai-agents-2025)
 
-### OWASP 与安全标准
-- [OWASP Top 10 for LLM Applications](https://owasp.org/www-project-top-10-for-large-language-model-applications/)
-- [OWASP LLM01: Prompt Injection](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)
+### SOC 2 与 ISO 27001 AI 合规扩展 (2025-2026)
+- [How AI Agents Impact SOC 2 Trust Services - Teleport](https://goteleport.com/blog/ai-agents-soc-2/)
+- [AI Governance Meets Compliance: Reshaping SOC 2, ISO 27001, etc. - CompliancePoint](https://www.compliancepoint.com/assurance/ai-governance-meets-compliance-how-ai-is-reshaping-pci-soc-2-hitrust-and-iso-27001/)
+- [Best GRC Tool 2026: ISO 27001, SOC 2, AI Compliance - Enactia](https://enactia.com/best-grc-tool-for-2026-the-ultimate-guide-to-iso-27001-soc-2-and-ai-compliance/)
+- [AI SOC, ISO 27001, SOC 2, Security Stack for 2026 - Penligent](https://www.penligent.ai/hackinglabs/ai-soc-iso-27001-soc-2-and-the-security-stack-real-ai-teams-need-in-2026/)
+- [Which Customer Support AI Agents Are SOC 2 Type II Certified - Fini Labs 2026](https://www.usefini.com/guides/soc-2-type-ii-certified-customer-support-ai-agents-2026)
+
+### EU AI Act 合规与安全
+- [EU AI Act Compliance Checker](https://artificialintelligenceact.eu/assessment/eu-ai-act-compliance-checker/)
+- [EU AI Act: Summary & Compliance Requirements - ModelOp](https://www.modelop.com/ai-governance/ai-regulations-standards/eu-ai-act)
+- [EU AI Act 2026 Compliance Guide - SecurePrivacy.ai](https://secureprivacy.ai/blog/eu-ai-act-2026-compliance)
+- [AI Compliance Checklist: SOC 2, GDPR, EU AI Act - CloudEagle.ai](https://www.cloudeagle.ai/blogs/ai-compliance-checklist)
+- [Shaping Europe's Digital Future: AI Policy](https://digital-strategy.ec.europa.eu/en/policies/regulatory-framework-ai)
 
 ### 审计与合规
-- [SOC2 Compliance for AI Agents](https://goteleport.com/blog/ai-agents-soc-2/)
-- [MCP Audit Logging](https://tetrate.io/learn/ai/mcp/mcp-audit-logging)
+- [MCP Audit Logging - Tetrate](https://tetrate.io/learn/ai/mcp/mcp-audit-logging)
 - [AI Agent Compliance & Governance (Galileo)](https://galileo.ai/blog/ai-agent-compliance-governance-audit-trails-risk-management)
 
 ### 访问控制与策略
 - [Beyond RBAC: Policy-as-Code for AI Agents](https://petronellatech.com/blog/beyond-rbac-policy-as-code-to-secure-llms-vector-dbs-and-ai-agents/)
 - [Kong: MCP Tool Governance](https://konghq.com/blog/engineering/mcp-tool-governance-security-meets-context-efficiency)
 - [Cerbos: MCP Authorization](https://www.cerbos.dev/blog/mcp-authorization)
+
+### 补充研究资源文档
+- [C10 增强型研究资料库](../_research_c10_enhanced.md) - 最新2025-2026年企业AI Agent安全研究综合
 
 ---
 

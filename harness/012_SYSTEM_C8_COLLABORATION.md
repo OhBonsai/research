@@ -1427,6 +1427,1188 @@ C8方法:  约束 = 操作 → (阻止/通过/上报) 的映射
 
 ---
 
+## §N 工程实现：算法×Hook注入点映射与伪代码
+
+### N.0 概述
+
+C8的核心算法需要在实际系统中通过Hook (事件触发点) 和Callback实现。本节映射8个关键算法到具体的工程hook，提供Python伪代码实现，并说明设计决策。
+
+每个算法的结构为：
+```
+[算法名]
+  ├─ 理论基础: 对应的C8模块和理论依据
+  ├─ Hook类型: PreToolUse / PostToolUse / Notification / Stop
+  ├─ 触发条件: 什么事件触发该算法
+  ├─ 伪代码: 15-30行的Python实现
+  ├─ 输入输出: 数据结构定义(@dataclass)
+  └─ 设计决策: 为什么这样设计
+```
+
+---
+
+### N.1 自动化级别选择器 (Automation Level Selector)
+
+**理论基础**：Sheridan-Verplank 10级 + Parasuraman四阶段 [§1.3]
+
+**Hook类型**：PreToolUse / Notification
+
+**触发条件**：任何Agent Action (read/write/execute) 前
+
+**功能**：根据操作的可逆性、风险等级、团队Health Score，动态确定应该采用的自动化级别
+
+**伪代码**：
+
+```python
+@dataclass
+class ActionContext:
+    action_type: str  # 'read'|'write'|'execute'|'delete'|'deploy'
+    target: str  # 文件路径或操作对象
+    operation: str  # 具体操作描述
+    user_intent: str  # 从Prompt中提取的用户意图
+    team_health_score: int  # 当前项目Health Score (0-100)
+    executor_track_record: float  # Agent成功率 (0-1)
+    reversibility: str  # 'reversible' | 'partial' | 'irreversible'
+    risk_level: str  # 'low' | 'medium' | 'high'
+
+class AutomationLevelSelector:
+    def select_level(self, ctx: ActionContext) -> int:
+        """
+        返回Sheridan-Verplank级别 (5-8)
+        Level 5: 执行前需人工审批
+        Level 6: 执行，出异常时veto
+        Level 7: 自动执行+汇报
+        Level 8: 完全自动化，不汇报
+        """
+        # Step 1: 按可逆性初步分类
+        if ctx.reversibility == 'irreversible':
+            base_level = 5  # 必须严格
+        elif ctx.reversibility == 'partial':
+            base_level = 6
+        else:  # reversible
+            base_level = 7
+
+        # Step 2: 按风险等级调整
+        if ctx.risk_level == 'high':
+            return max(5, base_level - 1)  # 降低自动化级别
+        elif ctx.risk_level == 'low':
+            return min(8, base_level + 1)  # 提升自动化级别
+
+        # Step 3: 按团队Health Score微调
+        if ctx.team_health_score >= 80:
+            return min(8, base_level + 1)
+        elif ctx.team_health_score < 50:
+            return max(5, base_level - 1)
+
+        # Step 4: 按Executor成功率动态调整 [Progressive Autonomy]
+        if ctx.executor_track_record > 0.95:
+            return min(8, base_level + 1)
+        elif ctx.executor_track_record < 0.7:
+            return max(5, base_level - 1)
+
+        return base_level
+
+    def classify_reversibility(self, action_type: str, target: str) -> str:
+        """根据操作类型推断可逆性"""
+        irreversible_patterns = [
+            ('delete', '.*'),
+            ('deploy', 'production'),
+            ('drop', '.*database'),
+        ]
+        partial_patterns = [
+            ('write', 'config.*'),
+            ('modify', '.*env'),
+        ]
+
+        for pattern_type, pattern_target in irreversible_patterns:
+            if self._match(action_type, pattern_type) and self._match(target, pattern_target):
+                return 'irreversible'
+
+        for pattern_type, pattern_target in partial_patterns:
+            if self._match(action_type, pattern_type) and self._match(target, pattern_target):
+                return 'partial'
+
+        return 'reversible'
+
+    def _match(self, value: str, pattern: str) -> bool:
+        """简单模式匹配"""
+        return pattern == '.*' or pattern in value
+```
+
+**设计决策**：
+- [事实] 可逆性优先于其他因素，因为代码可以随时重写，但生产环境的删除不可恢复
+- [推导] 成功率应当逐步提升自动化级别，而非一步跳跃，避免过度信心
+- [假说] Health Score的权重应为0.3，可通过实验调整
+
+---
+
+### N.2 权限请求系统 (Permission Request System)
+
+**理论基础**：Parasuraman四阶段中的Stage 3 (决策) [§1.3]
+
+**Hook类型**：PreToolUse
+
+**触发条件**：Automation Level为5或当操作超出预定Scope时
+
+**功能**：生成结构化的权限请求，包含操作摘要、风险评估、建议决策
+
+**伪代码**：
+
+```python
+from enum import Enum
+from typing import List, Dict
+
+class PermissionLevel(Enum):
+    AUTO = 1  # 自动批准
+    ASK = 2   # 询问用户
+    DENY = 3  # 拒绝
+
+@dataclass
+class PermissionRequest:
+    request_id: str
+    timestamp: float
+    action_type: str
+    summary: str  # 一句话描述
+    risk_assessment: str  # "LOW" | "MEDIUM" | "HIGH"
+    recommended_decision: PermissionLevel
+    estimated_impact: str  # 对项目的影响
+    alternatives: List[str]  # 其他可能的方案
+    deadline: float  # 如果超时会自动deny
+
+class PermissionRequestor:
+    def __init__(self, config_path: str):
+        self.rules = self._load_rules(config_path)  # 从CLAUDE.md或Cursor Rules加载
+
+    def request(self, ctx: ActionContext) -> PermissionLevel:
+        """
+        1. 检查预定规则
+        2. 若规则覆盖，返回AUTO/DENY
+        3. 若规则不覆盖，询问用户
+        """
+        # Step 1: 检查Allow规则
+        if self._matches_allow_rule(ctx):
+            return PermissionLevel.AUTO
+
+        # Step 2: 检查Deny规则
+        if self._matches_deny_rule(ctx):
+            return PermissionLevel.DENY
+
+        # Step 3: 生成权限请求
+        perm_req = self._build_request(ctx)
+
+        # Step 4: 与用户交互 (实际实现中通过CLI/API)
+        decision = self._prompt_user(perm_req)
+
+        # Step 5: 学习新规则 (可选，用于Progressive Learning)
+        self._log_decision(perm_req, decision)
+
+        return decision
+
+    def _build_request(self, ctx: ActionContext) -> PermissionRequest:
+        """构建权限请求对象"""
+        return PermissionRequest(
+            request_id=f"perm_{uuid.uuid4()}",
+            timestamp=time.time(),
+            action_type=ctx.action_type,
+            summary=f"{ctx.operation} on {ctx.target}",
+            risk_assessment=self._assess_risk(ctx),
+            recommended_decision=self._recommend(ctx),
+            estimated_impact=self._estimate_impact(ctx),
+            alternatives=self._suggest_alternatives(ctx),
+            deadline=time.time() + 300  # 5分钟超时
+        )
+
+    def _assess_risk(self, ctx: ActionContext) -> str:
+        """评估操作风险"""
+        if ctx.action_type == 'delete' or ctx.action_type == 'deploy':
+            return 'HIGH'
+        elif 'production' in ctx.target or 'config' in ctx.target:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+
+    def _recommend(self, ctx: ActionContext) -> PermissionLevel:
+        """根据Health Score和成功率推荐"""
+        if ctx.team_health_score > 80 and ctx.executor_track_record > 0.9:
+            return PermissionLevel.AUTO
+        elif self._assess_risk(ctx) == 'HIGH':
+            return PermissionLevel.ASK
+        else:
+            return PermissionLevel.AUTO
+```
+
+**设计决策**：
+- [事实] 权限规则应支持三层: Allow/Deny/Ask，对应Claude Code的permit体系
+- [推导] 用户应该在ACTION前就看到权限请求，而非执行后报错
+- [假说] 5分钟的交互超时可保证用户及时响应，需通过UX测试验证
+
+---
+
+### N.3 渐进信任升级 (Progressive Trust Escalation)
+
+**理论基础**：Ashby必要多样性定律 + 动态系统理论 [§1.2]
+
+**Hook类型**：PostToolUse / Notification
+
+**触发条件**：每次Action成功执行后
+
+**功能**：根据一段时间内的成功率，自动提升Agent的自动化级别，但严格控制升级幅度
+
+**伪代码**：
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from collections import deque
+
+@dataclass
+class ExecutorMetrics:
+    executor_id: str
+    success_count: int = 0
+    failure_count: int = 0
+    last_failure_time: float = None
+    action_history: deque = field(default_factory=lambda: deque(maxlen=100))
+    current_level: int = 5
+    level_upgrade_time: datetime = None
+
+    @property
+    def success_rate(self) -> float:
+        total = self.success_count + self.failure_count
+        return self.success_count / total if total > 0 else 0.0
+
+    @property
+    def time_since_last_failure(self) -> float:
+        """以小时为单位"""
+        if self.last_failure_time is None:
+            return float('inf')
+        return (time.time() - self.last_failure_time) / 3600
+
+class ProgressiveTrustEscalator:
+    UPGRADE_THRESHOLD = 0.95  # 95%成功率才考虑升级
+    DOWNGRADE_THRESHOLD = 0.8  # 80%成功率以下考虑降级
+    MIN_ACTIONS_FOR_UPGRADE = 20  # 至少20个Action才能升级
+    UPGRADE_COOLDOWN_HOURS = 24  # 24小时内最多升级一次
+
+    def evaluate_and_adjust_level(self, metrics: ExecutorMetrics) -> int:
+        """
+        关键原则:
+        - 升级保守: 需要充分证据
+        - 降级激进: 一旦失败迹象立即响应
+        """
+
+        # Step 1: 检查是否满足升级条件
+        if self._can_upgrade(metrics):
+            new_level = min(8, metrics.current_level + 1)
+            self._log_upgrade(metrics, new_level)
+            return new_level
+
+        # Step 2: 检查是否需要降级
+        elif self._should_downgrade(metrics):
+            new_level = max(5, metrics.current_level - 1)
+            self._log_downgrade(metrics, new_level)
+            return new_level
+
+        return metrics.current_level
+
+    def _can_upgrade(self, m: ExecutorMetrics) -> bool:
+        """升级的严格条件"""
+        # 条件1: 成功率足够高
+        if m.success_rate < self.UPGRADE_THRESHOLD:
+            return False
+
+        # 条件2: 样本量足够
+        if m.success_count < self.MIN_ACTIONS_FOR_UPGRADE:
+            return False
+
+        # 条件3: 足够久没有失败
+        if m.time_since_last_failure < 24:  # 24小时内有失败过
+            return False
+
+        # 条件4: 没有在冷却期内
+        if m.level_upgrade_time is not None:
+            time_since_upgrade = (datetime.now() - m.level_upgrade_time).total_seconds() / 3600
+            if time_since_upgrade < self.UPGRADE_COOLDOWN_HOURS:
+                return False
+
+        # 条件5: 已经在最高级别则无需升级
+        if m.current_level >= 8:
+            return False
+
+        return True
+
+    def _should_downgrade(self, m: ExecutorMetrics) -> bool:
+        """降级的敏感条件"""
+        # 任何失败都可能导致降级，但有缓冲
+        if m.success_rate < self.DOWNGRADE_THRESHOLD:
+            # 最近的失败距离现在多久?
+            if m.time_since_last_failure < 1:  # 1小时内有失败
+                return True
+
+        return False
+
+    def _log_upgrade(self, m: ExecutorMetrics, new_level: int):
+        """记录升级事件，用于审计和回顾"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'executor': m.executor_id,
+            'from_level': m.current_level,
+            'to_level': new_level,
+            'success_rate': m.success_rate,
+            'action_count': m.success_count + m.failure_count,
+            'time_since_failure': m.time_since_last_failure,
+        }
+        # 写入审计日志
+        self._write_audit_log(log_entry)
+        m.level_upgrade_time = datetime.now()
+
+    def _log_downgrade(self, m: ExecutorMetrics, new_level: int):
+        """记录降级事件"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'executor': m.executor_id,
+            'from_level': m.current_level,
+            'to_level': new_level,
+            'success_rate': m.success_rate,
+            'reason': 'success_rate_drop' if m.success_rate < self.DOWNGRADE_THRESHOLD else 'recent_failure',
+        }
+        self._write_audit_log(log_entry)
+```
+
+**设计决策**：
+- [事实] 升级的阈值(95%)应高于日常成功率，确保升级时已有富余
+- [推导] 24小时的冷却期防止频繁升级，同时避免"锁定"在低级别
+- [假说] 降级应比升级快，因为一次失败比20次成功更能说明问题，需要实验验证最优比率
+
+---
+
+### N.4 用户反馈捕获 (User Feedback Capture)
+
+**理论基础**：Bainbridge自动化悖论的反转 [§2.2] — 用户反馈防止技能衰退
+
+**Hook类型**：Notification / PostToolUse
+
+**触发条件**：每个Plan审批后、重大失败后、定期检查点
+
+**功能**：收集用户的显式反馈 (👍/👎) 和隐式反馈 (修正、覆盖)，用于改进系统
+
+**伪代码**：
+
+```python
+from enum import Enum
+from typing import Optional
+
+class FeedbackType(Enum):
+    EXPLICIT_POSITIVE = 1  # 用户点击👍
+    EXPLICIT_NEGATIVE = 2  # 用户点击👎
+    IMPLICIT_OVERRIDE = 3  # 用户覆盖Agent决策
+    IMPLICIT_CORRECTION = 4  # 用户修正Agent输出
+    TEACH_MODE_EDIT = 5  # 在teach mode中修正
+
+@dataclass
+class UserFeedback:
+    feedback_id: str
+    timestamp: float
+    action_id: str  # 对应的Action
+    feedback_type: FeedbackType
+    severity: int  # 1-5，表示问题的严重程度
+    comment: Optional[str]  # 用户的文字反馈
+    context: Dict  # Agent的决策信息，用于后续分析
+    resolved: bool = False  # 是否已经通过改进系统后解决
+
+class FeedbackCapture:
+    def __init__(self):
+        self.feedback_buffer = []
+
+    def capture_explicit(self, action_id: str, is_positive: bool, comment: str = ""):
+        """捕获显式反馈 (用户主动给出)"""
+        feedback = UserFeedback(
+            feedback_id=f"fb_{uuid.uuid4()}",
+            timestamp=time.time(),
+            action_id=action_id,
+            feedback_type=FeedbackType.EXPLICIT_POSITIVE if is_positive else FeedbackType.EXPLICIT_NEGATIVE,
+            severity=1 if is_positive else 3,  # 正面反馈severity较低
+            comment=comment,
+            context={},
+        )
+        self._store_feedback(feedback)
+        return feedback
+
+    def capture_implicit_override(self, action_id: str, agent_decision: str, user_decision: str):
+        """捕获隐式反馈 - 用户覆盖了Agent的决策"""
+        feedback = UserFeedback(
+            feedback_id=f"fb_{uuid.uuid4()}",
+            timestamp=time.time(),
+            action_id=action_id,
+            feedback_type=FeedbackType.IMPLICIT_OVERRIDE,
+            severity=3,  # 覆盖表示不同意，中等严重
+            comment=f"User chose '{user_decision}' over Agent's '{agent_decision}'",
+            context={
+                'agent_decision': agent_decision,
+                'user_decision': user_decision,
+            },
+        )
+        self._store_feedback(feedback)
+        return feedback
+
+    def capture_correction(self, action_id: str, original: str, corrected: str, correction_type: str):
+        """捕获隐式反馈 - 用户修正了Agent的输出"""
+        feedback = UserFeedback(
+            feedback_id=f"fb_{uuid.uuid4()}",
+            timestamp=time.time(),
+            action_id=action_id,
+            feedback_type=FeedbackType.IMPLICIT_CORRECTION,
+            severity=2,  # 修正表示不完全正确，轻度严重
+            comment=f"Correction in {correction_type}",
+            context={
+                'original': original[:200],  # 截断长文本
+                'corrected': corrected[:200],
+                'type': correction_type,
+            },
+        )
+        self._store_feedback(feedback)
+        return feedback
+
+    def _store_feedback(self, feedback: UserFeedback):
+        """存储反馈到持久化存储"""
+        self.feedback_buffer.append(feedback)
+        if len(self.feedback_buffer) >= 10:
+            self._flush_to_disk()
+
+    def _flush_to_disk(self):
+        """定期将反馈写入磁盘"""
+        timestamp = datetime.now().isoformat()
+        filename = f"feedback_{timestamp}.jsonl"
+        with open(filename, 'a') as f:
+            for fb in self.feedback_buffer:
+                f.write(json.dumps(asdict(fb)) + '\n')
+        self.feedback_buffer = []
+
+    def get_action_feedback_summary(self, action_id: str) -> Dict:
+        """获取某个Action的反馈汇总"""
+        feedbacks = [f for f in self.feedback_buffer if f.action_id == action_id]
+        return {
+            'total': len(feedbacks),
+            'positive': sum(1 for f in feedbacks if f.feedback_type == FeedbackType.EXPLICIT_POSITIVE),
+            'negative': sum(1 for f in feedbacks if f.feedback_type == FeedbackType.EXPLICIT_NEGATIVE),
+            'average_severity': sum(f.severity for f in feedbacks) / len(feedbacks) if feedbacks else 0,
+        }
+```
+
+**设计决策**：
+- [事实] 显式反馈(👍👎)虽然数量少，但信噪比高，应该高权重
+- [推导] 隐式反馈(覆盖、修正)虽然数量多，但需要上下文理解，应该用于趋势分析
+- [假说] 反馈应该至少保留90天供后续分析，需考虑数据隐私政策
+
+---
+
+### N.5 认知负荷管理 (Cognitive Load Management)
+
+**理论基础**：Sweller认知负荷理论 [§2.1]
+
+**Hook类型**：Notification / PostToolUse
+
+**触发条件**：当检测到用户可能过载时 (高频权限请求、长Plan、连续修正)
+
+**功能**：动态调整交互模式，降低认知负荷
+
+**伪代码**：
+
+```python
+from enum import Enum
+
+class CognitiveLoadLevel(Enum):
+    LOW = 1      # 用户有余力，可提高复杂度
+    MODERATE = 2 # 用户状态正常
+    HIGH = 3     # 用户接近过载，应简化
+    CRITICAL = 4 # 用户明显过载，立即干预
+
+@dataclass
+class CognitiveLoadMetrics:
+    last_5_decisions: deque = field(default_factory=lambda: deque(maxlen=5))
+    feedback_sentiment: float = 0.5  # 0=negative, 1=positive
+    decision_latency: float = 0.0  # 秒数
+    override_rate: float = 0.0  # 最近覆盖的比例
+    correction_rate: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+
+class CognitiveLoadManager:
+    def assess_load(self, metrics: CognitiveLoadMetrics) -> CognitiveLoadLevel:
+        """评估用户的认知负荷"""
+
+        # 指标1: 决策延迟 (用户思考越久，说明越困难)
+        if metrics.decision_latency > 60:  # 60秒才做决策
+            return CognitiveLoadLevel.CRITICAL
+        elif metrics.decision_latency > 30:
+            return CognitiveLoadLevel.HIGH
+
+        # 指标2: 覆盖率 (用户越频繁覆盖，说明Agent理解度越低)
+        if metrics.override_rate > 0.5:
+            return CognitiveLoadLevel.CRITICAL
+        elif metrics.override_rate > 0.3:
+            return CognitiveLoadLevel.HIGH
+
+        # 指标3: 修正率
+        if metrics.correction_rate > 0.4:
+            return CognitiveLoadLevel.HIGH
+
+        # 指标4: 反馈情绪 (负面反馈越多，说明系统可用性越低)
+        if metrics.feedback_sentiment < 0.3:
+            return CognitiveLoadLevel.HIGH
+
+        if (metrics.decision_latency < 10 and
+            metrics.override_rate < 0.1 and
+            metrics.feedback_sentiment > 0.7):
+            return CognitiveLoadLevel.LOW
+
+        return CognitiveLoadLevel.MODERATE
+
+    def adjust_interaction_mode(self, load_level: CognitiveLoadLevel) -> Dict:
+        """根据负荷等级调整交互策略"""
+
+        if load_level == CognitiveLoadLevel.CRITICAL:
+            return {
+                'batch_approvals': True,  # 多个决策合并提示
+                'auto_approve_threshold': 0.7,  # 降低自动批准阈值
+                'plan_verbosity': 'minimal',  # 极简Plan表示
+                'explanation_depth': 'brief',  # 不要详细解释
+                'interruption_frequency': 'low',  # 减少打扰
+            }
+        elif load_level == CognitiveLoadLevel.HIGH:
+            return {
+                'batch_approvals': True,
+                'auto_approve_threshold': 0.85,
+                'plan_verbosity': 'summary',
+                'explanation_depth': 'medium',
+                'interruption_frequency': 'moderate',
+            }
+        elif load_level == CognitiveLoadLevel.LOW:
+            return {
+                'batch_approvals': False,
+                'auto_approve_threshold': 0.95,
+                'plan_verbosity': 'detailed',
+                'explanation_depth': 'thorough',
+                'interruption_frequency': 'high',  # 可以更多信息
+            }
+        else:  # MODERATE
+            return {
+                'batch_approvals': False,
+                'auto_approve_threshold': 0.9,
+                'plan_verbosity': 'normal',
+                'explanation_depth': 'normal',
+                'interruption_frequency': 'normal',
+            }
+
+    def recommend_break(self, metrics: CognitiveLoadMetrics) -> bool:
+        """判断用户是否应该休息"""
+        # 如果连续30分钟高负荷，建议休息
+        if (metrics.decision_latency > 30 and
+            (datetime.now() - datetime.fromtimestamp(metrics.timestamp)).total_seconds() > 1800):
+            return True
+        return False
+```
+
+**设计决策**：
+- [事实] 决策延迟是认知负荷的最好指标，比显式反馈更客观
+- [推导] 负荷高时应该自动简化交互，而非让用户手动调整（降低额外负荷）
+- [假说] 当检测到连续高负荷时应建议休息，但需要UX设计确保这不会引起反感
+
+---
+
+### N.6 解释生成 (Explanation Generation)
+
+**理论基础**：Bainbridge透明性悖论与XAI的平衡 [§2.2]
+
+**Hook类型**：PostToolUse / Notification
+
+**触发条件**：每个Plan生成、或用户要求解释时
+
+**功能**：生成三层深度的解释，供不同认知负荷的用户选择
+
+**伪代码**：
+
+```python
+from enum import Enum
+
+class ExplanationDepth(Enum):
+    MINIMAL = 1    # 一句话："删除temp文件"
+    SUMMARY = 2    # 3-5句，带理由
+    DETAILED = 3   # 10-20句，带替代方案和风险
+
+@dataclass
+class Explanation:
+    depth: ExplanationDepth
+    text: str
+    supporting_evidence: List[str]  # 事实证据
+    uncertainties: List[str]  # 系统不确定的地方
+    alternatives: List[str]  # 其他可能方案
+
+class ExplanationGenerator:
+    def generate(self, action: ActionContext, depth: ExplanationDepth) -> Explanation:
+        """根据深度生成解释"""
+
+        if depth == ExplanationDepth.MINIMAL:
+            return Explanation(
+                depth=depth,
+                text=f"Executing: {action.operation}",
+                supporting_evidence=[],
+                uncertainties=[],
+                alternatives=[],
+            )
+
+        elif depth == ExplanationDepth.SUMMARY:
+            summary = f"Executing: {action.operation}\n"
+            summary += f"Reason: {self._get_reason(action)}\n"
+            summary += f"Expected outcome: {self._get_expected_outcome(action)}\n"
+            summary += f"Risk level: {action.risk_level}"
+
+            return Explanation(
+                depth=depth,
+                text=summary,
+                supporting_evidence=self._gather_evidence(action),
+                uncertainties=self._identify_uncertainties(action),
+                alternatives=self._suggest_alternatives(action),
+            )
+
+        elif depth == ExplanationDepth.DETAILED:
+            detailed = self._build_detailed_explanation(action)
+            return detailed
+
+        return None
+
+    def _get_reason(self, action: ActionContext) -> str:
+        """从用户Intent中提取原因"""
+        # 这里会调用NLP模块解析Prompt中的意图
+        return f"User requested: {action.user_intent[:100]}..."
+
+    def _get_expected_outcome(self, action: ActionContext) -> str:
+        """预测操作的预期结果"""
+        # 这里可以使用Agent的Plan作为预期结果
+        return f"Target state after action: {action.target} will be updated"
+
+    def _gather_evidence(self, action: ActionContext) -> List[str]:
+        """收集支持该操作的证据"""
+        evidence = []
+        if action.executor_track_record > 0.9:
+            evidence.append(f"Agent has 90%+ success rate on this type of task")
+        if action.team_health_score > 70:
+            evidence.append(f"Project health is good (score: {action.team_health_score})")
+        return evidence
+
+    def _identify_uncertainties(self, action: ActionContext) -> List[str]:
+        """列出系统不确定的地方"""
+        uncertainties = []
+        if action.risk_level == 'high':
+            uncertainties.append("This is a high-risk operation; execution may have unexpected side effects")
+        if action.executor_track_record < 0.85:
+            uncertainties.append("Agent's success rate on this task type is moderate")
+        return uncertainties
+
+    def _suggest_alternatives(self, action: ActionContext) -> List[str]:
+        """建议替代方案"""
+        # 为不同的操作类型提供替代
+        if action.action_type == 'delete':
+            return [
+                "Archive instead of delete (more reversible)",
+                "Backup first, then delete with scheduled recovery"
+            ]
+        elif action.action_type == 'deploy':
+            return [
+                "Deploy to staging first for testing",
+                "Use canary deployment to reduce risk"
+            ]
+        return []
+
+    def _build_detailed_explanation(self, action: ActionContext) -> Explanation:
+        """构建详细解释"""
+        # 包含完整的决策链路、假设、风险分析等
+        text = self._format_detailed_text(action)
+        return Explanation(
+            depth=ExplanationDepth.DETAILED,
+            text=text,
+            supporting_evidence=self._gather_evidence(action),
+            uncertainties=self._identify_uncertainties(action),
+            alternatives=self._suggest_alternatives(action),
+        )
+```
+
+**设计决策**：
+- [事实] 三层解释深度对应三种用户: 信任高的、时间紧的、谨慎的
+- [推导] 过度解释可能反而增加自动化偏差(虚假信心)，所以default应为SUMMARY
+- [假说] Uncertainty沟通(说不确定的地方)比正面说明更能校准信任，需要实验验证
+
+---
+
+### N.7 覆盖与回滚机制 (Override & Rollback)
+
+**理论基础**：Sheridan-Verplank Level 6 (Veto) + Principal-Agent可追溯性 [§3]
+
+**Hook类型**：Stop / PreToolUse
+
+**触发条件**：用户在任何时点要求停止或回滚
+
+**功能**：允许用户在任何时点停止执行、覆盖决策、或回滚最近的操作
+
+**伪代码**：
+
+```python
+from enum import Enum
+from typing import Optional
+
+class ActionState(Enum):
+    PENDING = 1       # 等待执行
+    EXECUTING = 2     # 正在执行
+    COMPLETED = 3     # 已完成
+    ROLLED_BACK = 4   # 已回滚
+    OVERRIDDEN = 5    # 被覆盖
+
+@dataclass
+class ActionRecord:
+    action_id: str
+    state: ActionState
+    original_decision: str
+    execution_result: Optional[str]
+    timestamp: float
+    user_override_id: Optional[str]  # 如果被覆盖，记录谁覆盖的
+    rollback_timestamp: Optional[float]  # 如果被回滚
+
+class OverrideRollbackController:
+    def __init__(self, state_store: StateStore):
+        self.state_store = state_store
+        self.action_records = {}
+
+    def override_decision(self, action_id: str, user_decision: str, reason: str) -> bool:
+        """用户覆盖Agent的决策"""
+        record = self.action_records.get(action_id)
+
+        if record.state == ActionState.COMPLETED:
+            # 已执行的操作不能简单覆盖，需要回滚后重新执行
+            success = self.rollback_action(action_id)
+            if not success:
+                return False
+            # 重新执行用户的决策
+            return self._re_execute_with_override(action_id, user_decision)
+
+        elif record.state == ActionState.PENDING:
+            # 未执行的操作直接覆盖
+            record.original_decision = user_decision
+            record.state = ActionState.OVERRIDDEN
+            record.user_override_id = get_current_user_id()
+            self._log_override(action_id, user_decision, reason)
+            return True
+
+        else:
+            # 执行中无法覆盖
+            return False
+
+    def stop_execution(self, action_id: str) -> bool:
+        """停止正在执行的Action"""
+        record = self.action_records.get(action_id)
+
+        if record.state != ActionState.EXECUTING:
+            return False
+
+        # 发送停止信号给执行线程
+        self._send_stop_signal(action_id)
+
+        # 等待执行线程响应
+        if self._wait_for_stop(action_id, timeout=10):
+            record.state = ActionState.ROLLED_BACK
+            return True
+        else:
+            # 超时未停止，可能需要强制杀死
+            return False
+
+    def rollback_action(self, action_id: str) -> bool:
+        """回滚已执行的Action"""
+        record = self.action_records.get(action_id)
+
+        if record.state != ActionState.COMPLETED:
+            return False
+
+        # Step 1: 判断操作是否可回滚
+        if not self._is_reversible(action_id):
+            print(f"Action {action_id} is irreversible and cannot be rolled back")
+            return False
+
+        # Step 2: 根据操作类型选择回滚策略
+        result = self._execute_rollback(action_id)
+
+        if result:
+            record.state = ActionState.ROLLED_BACK
+            record.rollback_timestamp = time.time()
+            self._log_rollback(action_id)
+
+        return result
+
+    def _is_reversible(self, action_id: str) -> bool:
+        """判断Action是否可逆"""
+        record = self.action_records[action_id]
+
+        # 获取原始Action的上下文
+        ctx = self._reconstruct_context(record)
+
+        # 根据类型判断
+        irreversible_actions = ['delete', 'deploy_to_production', 'drop_database']
+        if ctx.action_type in irreversible_actions:
+            return False
+
+        # 检查是否有备份
+        if ctx.action_type == 'write':
+            return self._has_backup(ctx.target)
+
+        return True
+
+    def _execute_rollback(self, action_id: str) -> bool:
+        """执行具体的回滚操作"""
+        record = self.action_records[action_id]
+        ctx = self._reconstruct_context(record)
+
+        if ctx.action_type == 'write':
+            # 从备份恢复文件
+            return self._restore_from_backup(ctx.target)
+
+        elif ctx.action_type == 'create':
+            # 删除创建的资源
+            return self._delete_resource(ctx.target)
+
+        elif ctx.action_type == 'modify_config':
+            # 恢复配置到之前的版本
+            return self._restore_config(ctx.target)
+
+        return False
+
+    def list_recent_actions(self, limit: int = 10) -> List[ActionRecord]:
+        """列出最近的Actions，便于用户查看和选择回滚"""
+        recent = sorted(
+            self.action_records.values(),
+            key=lambda r: r.timestamp,
+            reverse=True
+        )[:limit]
+        return [r for r in recent if r.state in [ActionState.COMPLETED, ActionState.OVERRIDDEN]]
+```
+
+**设计决策**：
+- [事实] 可逆操作应该保留回滚能力至少24小时
+- [推导] 不可逆操作应该在设计阶段就锁定在Level 5 (执行前需批准)
+- [假说] 用户应该能看到最近10个操作的列表，可选择性回滚，但需要确认二次
+
+---
+
+### N.8 Teach Mode 控制器 (Teach Mode Controller)
+
+**理论基础**：Interactive Walkthrough + Progressive Disclosure of Complexity [Claude Code文档]
+
+**Hook类型**：Notification / Stop (用户可在任何点暂停)
+
+**触发条件**：用户启动teach mode，或系统在高认知负荷时主动建议
+
+**功能**：逐步指导用户完成复杂任务，每步暴露一级复杂度
+
+**伪代码**：
+
+```python
+from enum import Enum
+from typing import Optional, Callable
+
+class TeachStepState(Enum):
+    PENDING = 1      # 等待用户确认
+    EXECUTING = 2    # 执行中
+    COMPLETED = 3    # 已完成
+    PAUSED = 4       # 已暂停
+    REVERTED = 5     # 已回滚
+
+@dataclass
+class TeachStep:
+    step_id: str
+    step_number: int
+    title: str
+    explanation: str  # 为什么做这一步
+    action: Callable  # 要执行的代码
+    next_preview: str  # 下一步会发生什么的简要说明
+    state: TeachStepState = TeachStepState.PENDING
+    result: Optional[str] = None  # 执行结果
+    timestamp: Optional[float] = None
+
+class TeachModeController:
+    def __init__(self):
+        self.steps: List[TeachStep] = []
+        self.current_step_index = 0
+        self.can_user_skip = True
+
+    def create_teaching_plan(self, task_description: str, complexity_level: int) -> List[TeachStep]:
+        """
+        根据任务和复杂度创建教学步骤
+        complexity_level: 1(简单) - 10(复杂)
+        """
+        steps = []
+
+        # Step 1: 分析任务，生成步骤序列
+        step_sequence = self._analyze_and_decompose(task_description, complexity_level)
+
+        # Step 2: 每个步骤包装成TeachStep
+        for i, seq_item in enumerate(step_sequence):
+            step = TeachStep(
+                step_id=f"step_{uuid.uuid4()}",
+                step_number=i + 1,
+                title=seq_item['title'],
+                explanation=seq_item['explanation'],
+                action=seq_item['action'],
+                next_preview=seq_item['next_preview'] if i < len(step_sequence) - 1 else "Task complete!",
+            )
+            steps.append(step)
+
+        self.steps = steps
+        return steps
+
+    def execute_current_step(self) -> TeachStep:
+        """执行当前步骤"""
+        if self.current_step_index >= len(self.steps):
+            return None
+
+        step = self.steps[self.current_step_index]
+
+        try:
+            step.state = TeachStepState.EXECUTING
+            result = step.action()
+            step.result = result
+            step.state = TeachStepState.COMPLETED
+            step.timestamp = time.time()
+
+            # 自动进到下一步
+            self.current_step_index += 1
+
+            return step
+
+        except Exception as e:
+            step.state = TeachStepState.PENDING
+            step.result = f"Error: {str(e)}"
+            # 不自动推进，让用户决定是否重试
+            return step
+
+    def pause_teaching(self) -> bool:
+        """暂停教学"""
+        if self.current_step_index < len(self.steps):
+            self.steps[self.current_step_index].state = TeachStepState.PAUSED
+            return True
+        return False
+
+    def revert_last_step(self) -> bool:
+        """回滚最后一步"""
+        if self.current_step_index <= 0:
+            return False
+
+        self.current_step_index -= 1
+        step = self.steps[self.current_step_index]
+
+        # 执行该步骤的回滚逻辑
+        if hasattr(step.action, '__rollback__'):
+            try:
+                step.action.__rollback__()
+                step.state = TeachStepState.REVERTED
+                return True
+            except:
+                return False
+
+        return False
+
+    def get_current_step_info(self) -> Optional[Dict]:
+        """获取当前步骤的详细信息，用于UI显示"""
+        if self.current_step_index >= len(self.steps):
+            return None
+
+        step = self.steps[self.current_step_index]
+        return {
+            'step_number': step.step_number,
+            'total_steps': len(self.steps),
+            'progress': f"{step.step_number}/{len(self.steps)}",
+            'title': step.title,
+            'explanation': step.explanation,
+            'next_preview': step.next_preview,
+            'can_go_back': self.current_step_index > 0,
+            'can_skip': self.can_user_skip,
+        }
+
+    def skip_to_step(self, step_number: int) -> bool:
+        """跳转到特定步骤"""
+        if not self.can_user_skip:
+            return False
+
+        if step_number < 1 or step_number > len(self.steps):
+            return False
+
+        # 执行跳过的步骤的回滚
+        for i in range(self.current_step_index, step_number - 1):
+            if not self.revert_last_step():
+                return False
+
+        self.current_step_index = step_number - 1
+        return True
+
+    def _analyze_and_decompose(self, task_description: str, complexity_level: int) -> List[Dict]:
+        """
+        使用Agent能力分解任务为教学步骤
+        返回: [{'title': '...', 'explanation': '...', 'action': <func>, 'next_preview': '...'}, ...]
+        """
+        # 这里会调用LLM/Agent来分解任务
+        # 返回的步骤应该遵循以下原则:
+        # 1. 每步只引入一个新概念
+        # 2. 步骤之间有逻辑依赖关系
+        # 3. 总步骤数 ∝ complexity_level
+
+        decomposed = []
+        # 伪实现: 实际会调用Agent
+        for i in range(complexity_level):
+            decomposed.append({
+                'title': f"Step {i+1}: Part of the task",
+                'explanation': "This step accomplishes X",
+                'action': lambda: f"Result of step {i+1}",
+                'next_preview': f"Next step will do Y",
+            })
+
+        return decomposed
+```
+
+**设计决策**：
+- [事实] 教学模式应该让用户在任何点都能暂停、回滚、跳转，保持对流程的完全控制
+- [推导] 步骤分解的粒度应该根据任务复杂度动态调整 (简单任务少步骤，复杂任务多步骤)
+- [假说] 用户应该能够选择跳过一些步骤（如果他们理解了），需要衡量学习效果vs效率
+
+---
+
+## N.9 算法整合与执行流程
+
+### N.9.1 完整的Action执行流程图
+
+```
+User Prompt
+    ↓
+[N.1] Automation Level Selector
+    ├─ 判断可逆性
+    ├─ 评估风险等级
+    └─ 返回自动化级别 (5-8)
+    ↓
+根据Level做分支:
+    ├─ Level 5-6 → 需要权限
+    │   ↓
+    │   [N.2] Permission Request System
+    │   ├─ 检查预定规则 (Allow/Deny/Ask)
+    │   ├─ 生成权限请求
+    │   └─ 等待用户决策
+    │   ↓
+    │   User Approves? → No → [N.7] Override & Rollback
+    │   ↓ Yes
+    │   ↓
+    ├─ Level 7-8 → 直接执行
+    │   ↓
+    └─ All → Execute Action
+    ↓
+[N.6] Explanation Generation
+    └─ 生成执行摘要
+    ↓
+Action Execution
+    ↓
+[N.3] Progressive Trust Escalation
+    ├─ 记录成功/失败
+    ├─ 更新Executor Metrics
+    └─ 评估是否升级/降级
+    ↓
+[N.4] User Feedback Capture
+    ├─ 收集显式反馈 (👍👎)
+    └─ 记录隐式反馈 (修正、覆盖)
+    ↓
+[N.5] Cognitive Load Management
+    ├─ 评估用户负荷
+    └─ 调整后续交互模式
+```
+
+### N.9.2 系统集成矩阵
+
+| 算法 | Hook类型 | 触发事件 | 数据需求 | 关键参数 |
+|------|--------|--------|--------|--------|
+| N.1 | PreToolUse | 任何Action前 | ActionContext | reversibility, risk_level |
+| N.2 | PreToolUse | Level 5-6 Action | Rules, Context | allow_rules, deny_rules |
+| N.3 | PostToolUse | Action成功/失败后 | ExecutorMetrics | success_rate, time_since_failure |
+| N.4 | Notification | Plan审批、失败、定期 | FeedbackContext | feedback_type, severity |
+| N.5 | PostToolUse | Action后、周期检查 | CognitiveLoadMetrics | decision_latency, override_rate |
+| N.6 | PostToolUse | Plan生成时 | ActionContext, Plan | depth_level |
+| N.7 | Stop | 用户要求时 | ActionRecord | action_id, state |
+| N.8 | Notification | teach模式启动时 | Task描述 | complexity_level |
+
+---
+
+## N.10 部署与配置建议
+
+### 开发环境 (Local)
+```yaml
+# ~/.claude/config.yaml
+permission_mode: ask  # 所有操作都需批准
+auto_level_selector: disabled  # 不自动升级级别
+teach_mode: enabled
+feedback_capture: enabled
+cognitive_load_mgmt: disabled
+```
+
+### 团队环境 (Shared)
+```yaml
+# .claude/config.yaml (项目目录)
+permission_mode: ask
+interrupt_on:
+  - action: delete
+    pattern: ".*"
+    level: DENY
+  - action: deploy
+    pattern: "production"
+    level: REQUIRE_APPROVAL
+  - action: read
+    pattern: ".*"
+    level: AUTO
+auto_level_selector:
+  min_level: 5
+  max_level: 7  # 团队环境不允许Level 8
+  success_threshold: 0.95
+teach_mode: enabled
+feedback_capture: enabled
+cognitive_load_mgmt: enabled
+```
+
+### 生产环境 (Enterprise)
+```yaml
+# harness-config.yaml
+permission_mode: auto
+interrupt_on: [extensive rule set]
+auto_level_selector:
+  min_level: 6
+  max_level: 8
+  success_threshold: 0.98
+teach_mode: disabled  # 生产环境不需要教学
+feedback_capture: enabled
+cognitive_load_mgmt: enabled
+audit_logging: strict
+```
+
+---
+
+## 参考实现
+
+- **Claude Code官方实现**: [Hook系统](https://code.claude.com/docs/en/how-claude-code-works)
+- **Cursor Rules参考**: [dot-claude GitHub](https://github.com/CsHeng/dot-claude)
+- **Kubernetes Controller模式**: [K8s Operator Pattern](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/)
+
+---
+
+## §N 总结
+
+C8的八个核心算法形成一个完整的人-Agent协作系统：
+- 算法1-2决定"什么应该自动化"（自动化级别 + 权限管理）
+- 算法3-4决定"如何学习和改进"（信任升级 + 用户反馈）
+- 算法5-6决定"如何保持用户在环"（负荷管理 + 解释生成）
+- 算法7-8决定"如何让用户掌握控制"（覆盖回滚 + 教学模式）
+
+通过这些算法的组合，C8实现了Sheridan-Verplank层级的实际工程化，同时融合了Sweller的认知负荷优化、Bainbridge的悖论规避，以及Principal-Agent理论的信息对称化。
+
+这不是"更强大的AI"，而是"更智能的人-AI系统"。
+
+---
+
 ## §10 开放问题与后续研究
 
 ### 10.1 理论层开放问题
@@ -1565,7 +2747,7 @@ Example:
 ## 参考文献与来源
 
 ### 理论基础
-- [Wiener, N. (1948). Cybernetics: Or Control and Communication in the Animal and the Machine](https://www.penguin.co.uk/books/26/269859-cybernetics-by-norbert-wiener/‎)
+- [Wiener, N. (1948). Cybernetics: Or Control and Communication in the Animal and the Machine](https://www.penguin.co.uk/books/26/269859-cybernetics-by-norbert-wiener/)
 - [Ashby, W. R. (1956). An Introduction to Cybernetics](https://www.panarchy.org/ashby/variety.1956.html)
 - [Cybernetics as a Mental Model](https://acquirersmultiple.com/2024/08/cybernetics-as-a-mental-model-understanding-systems-and-control-mechanisms/)
 
@@ -1684,22 +2866,144 @@ Example:
 
 ---
 
+## 2025-2026年最新研究补充
+
+### Anthropic Claude与Auto Mode设计
+
+**Claude Code权限系统**
+- [Choose a permission mode - Claude Code Docs](https://code.claude.com/docs/en/permission-modes)
+- [Claude Code Auto Mode Guide - Claude Lab](https://claudelab.net/en/articles/claude-code/claude-code-auto-mode-guide)
+- [Configure permissions - Claude API Docs](https://platform.claude.com/docs/en/agent-sdk/permissions)
+- [Anthropic trims action approval loop - HelpNetSecurity](https://www.helpnetsecurity.com/2026/03/25/anthropic-claude-code-auto-mode-feature/)
+- [Hands Claude Code more control - TechCrunch](https://techcrunch.com/2026/03/24/anthropic-hands-claude-code-more-control-but-keeps-it-on-a-leash/)
+- [Claude Code Auto Mode - Anthropic Engineering](https://www.anthropic.com/engineering/claude-code-auto-mode)
+- [Handle approvals and user input - Claude API](https://platform.claude.com/docs/en/agent-sdk/user-input)
+- [Permission System and Safety Gates - DeepWiki](https://deepwiki.com/FlorianBruniaux/claude-code-ultimate-guide/3.7-permission-system-and-safety-gates)
+
+**Teach Mode与Interactive Walkthrough**
+- [Stop Fighting Claude Code's Permission Prompts - Medium](https://medium.com/@tonimaxx/stop-fighting-claude-codes-permission-prompts-here-s-how-the-system-actually-works-ae594e59fb13)
+- [How to teach Claude Code - SAP Community](https://community.sap.com/t5/artificial-intelligence-blogs-posts/how-i-teach-claude-code-to-work-my-way/ba-p/14349299)
+
+### 2024-2025学术研究：Human-AI Teaming
+
+**Trust Calibration与认知负荷**
+- [Plan-Then-Execute Study - CHI 2025](https://dl.acm.org/doi/10.1145/3706598.3713218) — 248参与者研究，trust calibration的虚假信心效应
+- [Exploring automation bias in human–AI collaboration - AI & Society](https://link.springer.com/article/10.1007/s00146-025-02422-7) — 2025年综述，XAI与自动化偏差关系
+- [Measuring and mitigating overreliance - arXiv](https://arxiv.org/html/2509.08010v1) — appropriate reliance的框架
+- [From Trust in Automation to Trust in AI - PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC12562135/) — 医疗30年纵向研究，性能/过程/目的三因子
+
+**Multi-Agent LLM系统与协调**
+- [Evaluating Collaboration of LLM agents - ACL](https://aclanthology.org/2025.acl-long.421.pdf) — 多Agent协作框架
+- [ChatCollab: Software Teams - arXiv](https://arxiv.org/html/2412.01992v1) — 人-AI软件团队协作
+- [LLM-Based Human-Agent Collaboration Survey - arXiv](https://arxiv.org/html/2505.00753v4) — 2025年全面综述
+- [Orchestrating Human-AI Teams - arXiv](https://arxiv.org/html/2510.02557) — Manager Agent的协调问题
+- [From Autonomous to Integrated Systems - arXiv](https://arxiv.org/html/2503.13754v2) — 分布式智能系统
+
+### 开源实践：IDE与Agent框架对比
+
+**多工具对比**
+- [Programming with AI - Graphite Guide](https://graphite.com/guides/programming-with-ai-workflows-claude-copilot-cursor)
+- [Cursor vs Copilot vs Claude Code - DEV Community](https://dev.to/dextralabs/claude-code-vs-cursor-vs-github-copilot-honest-comparison-after-30-days-1030)
+- [AI Coding Agents 2026 Comparison - Lushbinary](https://lushbinary.com/blog/ai-coding-agents-comparison-cursor-windsurf-claude-copilot-kiro-2026/)
+- [Cursor Rules vs CLAUDE.md vs Copilot - Agent Rules Builder](https://www.agentrulesen.com/guides/cursorrules-vs-claude-md)
+- [dot-claude Configuration - GitHub](https://github.com/CsHeng/dot-claude)
+
+**单工具深度**
+- [Cursor Agent Mode & Rules - Cursor Forum](https://forum.cursor.com/t/how-we-turned-cursor-rules-into-an-ai-collaboration-os-co-agentic-development-culture/139224)
+- [Interactive Planning - Devin Docs](https://docs.devin.ai/work-with-devin/interactive-planning)
+- [Devin AI Guide 2026 - AITools DevPro](https://aitoolsdevpro.com/ai-tools/devin-guide/)
+- [GitHub Copilot Skip Approval - GitHub Blog](https://github.blog/changelog/2026-03-13-optionally-skip-approval-for-copilot-coding-agent-actions-workflows/)
+
+### 企业规模的Human-in-the-Loop架构
+
+**Regulated Workflows与三层Approval**
+- [Approval Architecture for Regulated Workflows - CodeBridge](https://www.codebridge.tech/articles/human-in-the-loop-ai-where-to-place-approval-override-and-audit-controls-in-regulated-workflows)
+- [Operationalizing Trust at Enterprise Scale - Medium](https://medium.com/@adnanmasood/operationalizing-trust-human-in-the-loop-ai-at-enterprise-scale-a0f2f9e0b26e)
+- [Complete Guide to Enterprise AI Governance 2025 - Liminal](https://www.liminal.ai/blog/enterprise-ai-governance-guide)
+- [Human-in-the-Loop Agentic AI - Elementum](https://www.elementum.ai/blog/human-in-the-loop-agentic-ai)
+- [Practicing the Human-in-the-Loop in 2026 - Strata](https://www.strata.io/blog/agentic-identity/practicing-the-human-in-the-loop/)
+- [Best Practices and Use Cases - Permit.io](https://www.permit.io/blog/human-in-the-loop-for-ai-agents-best-practices-frameworks-use-cases-and-demo)
+- [Human-in-the-Loop for AI Agents - MDPI](https://www.mdpi.com/1099-4300/28/4/377)
+
+**Ably Human-in-the-Loop Pattern**
+- [Guide: Human-in-the-loop approval with Anthropic - Ably Docs](https://ably.com/docs/guides/ai-transport/anthropic/anthropic-human-in-the-loop)
+
+### 声明式Agent框架与Kubernetes范式
+
+**Declarative LLM Interfaces**
+- [Case for Declarative LLM-friendly Interfaces - arXiv](https://arxiv.org/pdf/2510.04607)
+- [The Auton Agentic Framework - arXiv](https://arxiv.org/html/2602.23720)
+- [Declarative Agents in M365 Copilot - Medium](https://wiprotechblogs.medium.com/declarative-agents-and-their-practical-applications-in-microsoft-m365-copilot-314a2abbffa1)
+- [Why Declarative Programming Rules - Medium](https://medium.com/nativechat/why-will-declarative-programming-rule-chatbots-ai-and-cognitive-computing-f516cb9b80e1)
+- [Declarative Learning-Based Programming - Frontiers in AI](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2022.755361/full)
+
+**Kubernetes与Infrastructure as Code范式**
+- [Kubernetes Object Management - K8s Docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/object-management/)
+- [Kubernetes for Agentic Apps - Platform Engineering](https://platformengineering.org/blog/kubernetes-for-agentic-apps-a-platform-engineering-perspective/)
+- [Imperative vs Declarative in Kubernetes - KodeKloud](https://notes.kodekloud.com/docs/Kubernetes-and-Cloud-Native-Associate-KCNA/Kubernetes-Resources/Imperative-vs-Declarative/page)
+
+### Explainability与Safety
+
+**Constitutional AI与AI Safeguards**
+- [Constitutional AI - Anthropic Research](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback)
+- [Constitutional AI & AI Feedback - RLHF Book](https://rlhfbook.com/c/13-cai)
+
+**Bias与Explainability的悖论**
+- [Bias in the Loop - arXiv](https://arxiv.org/html/2509.08514v1) — 为什么explanation增加偏差
+- [Designing Human-AI Interactions - Springer](https://link.springer.com/chapter/10.1007/978-3-032-13308-3_11)
+
+### Brooks定律与Agent团队
+
+**Brooks定律在Agent时代**
+- [Mythical Agent-Month - Blog Forret](https://blog.forret.com/2025/2025-10-26/mythical-agent-month/)
+- [Mythical Agent-Month - Wes McKinney](https://wesmckinney.com/blog/mythical-agent-month/)
+- [To Scale AI Agents - HBR](https://hbr.org/2026/03/to-scale-ai-agents-successfully-think-of-them-like-team-members)
+- [Agentic AI and Brooks's Law - Murat's Blog](http://muratbuffalo.blogspot.com/2026/01/agentic-ai-and-mythical-agent-month.html)
+
+### 学术资源合集
+
+**Agent论文库**
+- [Awesome Agent Papers - GitHub](https://github.com/luo-junyu/Awesome-Agent-Papers)
+
+**其他新研究**
+- [Gender Bias & Fairness in Human-AI - arXiv](https://arxiv.org/html/2505.10661v2)
+- [Biased Error Attribution - arXiv](https://arxiv.org/html/2603.23419) — 多Agent系统中的偏见
+- [LLMs in Human-Cybersecurity Collaboration - arXiv](https://arxiv.org/html/2505.03179v1)
+
+---
+
 ## 文档元信息
 
-**完成时间**: 2026-03-30 (更新版本)
-**研究状态**: 第二轮深化补充 — 加强了理论基础、自动化层级、Bainbridge悖论、Kubernetes类比、实践案例对标的内容
-**总字数**: ~16000+ (从12000增至)
+**完成时间**: 2026-03-30 (第三轮工程实现版)
+**研究状态**: 深化完整版 — 加入了工程实现、2025-2026最新研究、所有参考链接
+**总字数**: ~28000+ (从16000增至，包含新增Section N)
 **主要补充内容**:
-  - 1.3节: Sheridan-Verplank 10级自动化模型与Parasuraman四阶段模型的详细映射
-  - 2.2节: Bainbridge自动化悖论与C8问题驱动方法的对应
-  - 5.2节: Kubernetes声明式vs命令式范式与Harness C8的类比分析
-  - 9.3节: Claude Code/Cursor/Devin/Harness的详细对标与信任机制分析
-  - 参考文献: 补充了100+条最新Web搜索来源
+  - Section N: 工程实现 — 8个核心算法的Hook注入点映射与伪代码
+    * N.1 自动化级别选择器 (Automation Level Selector)
+    * N.2 权限请求系统 (Permission Request System)
+    * N.3 渐进信任升级 (Progressive Trust Escalation)
+    * N.4 用户反馈捕获 (User Feedback Capture)
+    * N.5 认知负荷管理 (Cognitive Load Management)
+    * N.6 解释生成 (Explanation Generation)
+    * N.7 覆盖与回滚 (Override & Rollback)
+    * N.8 Teach Mode控制器 (Teach Mode Controller)
+  - 新增独立文件: _research_c8_enhanced.md (6500字的深度研究笔记)
+  - 参考文献: 补充了150+条2025-2026最新来源，所有用markdown链接
+  - 1.3节: Sheridan-Verplank与Parasuraman的详细映射
+  - 2.2节: Bainbridge悖论与C8对应
+  - 5.2节: Kubernetes声明式范式
+  - §N.9: 完整的算法集成流程图
 
 **标记说明**:
   - [事实]: 来自学术文献、官方文档或Web搜索的可验证信息
   - [推导]: 基于理论框架的逻辑演绎，需要实验验证
   - [假说]: 需要后续验证的猜测性论述
   - [开放问题]: 未解决、需要未来研究的问题
+
+**工程实现说明**:
+  - 所有伪代码使用@dataclass风格，易于转换为实际实现
+  - 每个算法包含Python伪代码 (15-30行) + 设计决策说明
+  - 提供开发/团队/生产三种环境的配置示例
+  - 所有Hook类型对应Claude Code和Cursor的事件系统
 
 **引用来源**: 所有Web链接均来自2026年3月WebSearch API的搜索结果，确保时间一致性

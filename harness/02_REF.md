@@ -22,21 +22,33 @@ https://docs.langchain.com/oss/python/deepagents/harness
 
 ### 2. OpenAI 系列（Codex Harness 工程实践）
 
-**Harness Engineering: Leveraging Codex in an Agent-First World** — OpenAI
-OpenAI 官方关于 Harness Engineering 的定义与最佳实践。（403 无法抓取全文，但搜索摘要显示其定义了 Codex Harness 的实施方法）
+**Harness Engineering: Leveraging Codex in an Agent-First World** — OpenAI (Ryan Lopopolo, 2026.2.11)
+★ 极高价值。OpenAI 团队用 Codex 构建了百万行零人工代码产品的完整复盘。关键上下文管理洞察："Give Codex a map, not a 1,000-page instruction manual"——AGENTS.md 作为约 100 行的目录索引，docs/ 目录作为 system of record，实现渐进式披露。明确指出"Context is a scarce resource"，巨型指令文件会挤占任务和代码的上下文空间。"From the agent's point of view, anything it can't access in-context while running effectively doesn't exist"——所有知识必须在仓库内、版本化、可寻址。熵治理："golden principles" + 定期 GC agent 扫描并修复偏差，类比垃圾回收。工程实践：3人团队平均每人每天 3.5 个 PR，扩展到 7 人仍未触发 Brooks 定律。
 https://openai.com/index/harness-engineering/
 
-**Unrolling the Codex Agent Loop** — OpenAI
-Codex Agent Loop 的技术架构深度解析。关键点：无状态请求处理（Zero Data Retention 合规）、Prompt 缓存优化（线性而非二次方性能）、Compaction 机制（通过 /responses/compact 端点压缩对话）、三类工具来源（Codex 内置、API、MCP）、仅 Codex 工具有沙箱隔离。
+**Unrolling the Codex Agent Loop** — OpenAI (Michael Bolin, 2026.1.23)
+★ 极高价值，Codex Agent Loop 的权威技术深度解析。上下文管理核心内容：（1）Prompt 结构——system（模型指令）→ tools → developer（sandbox 权限）→ developer（config）→ user（AGENTS.md 聚合指令，32KiB 上限）→ user（环境上下文 cwd/shell）→ user message，顺序由服务端决定。（2）Prompt 缓存——"old prompt is exact prefix of new prompt"是刻意设计，使采样从二次方降为线性；缓存失效原因：mid-conversation 工具变更、模型切换、sandbox/cwd 变更；MCP 工具枚举顺序不稳定曾导致缓存失效 bug。（3）Compaction 演化——从手动 `/compact` 命令 → 自动 `auto_compact_limit` 阈值触发 → `/responses/compact` 端点返回 opaque `encrypted_content` 保留模型对原始对话的潜在理解。（4）ZDR（Zero Data Retention）合规——不使用 `previous_response_id`，每次请求无状态，加密推理内容可由 OpenAI 持有的解密密钥恢复。（5）环境变更处理——sandbox/cwd 变更时追加新 developer/user 消息而非修改历史消息，保护缓存前缀。
 https://openai.com/index/unrolling-the-codex-agent-loop/
 
-**Unlocking the Codex Harness: How We Built the App Server** — OpenAI
-Codex Harness 如何支撑多个产品表面（CLI、Web、IDE、macOS App）共享同一套 Agent Loop 和执行逻辑。
+**Unlocking the Codex Harness: How We Built the App Server** — OpenAI (Celia Chen, 2026.2.4)
+Codex App Server 架构详解。JSON-RPC over stdio 双向协议，支撑 CLI、Web、IDE（VS Code/JetBrains/Xcode）、macOS App 共享同一 Harness。三层会话原语：Item（原子 I/O 单元，有 started/delta/completed 生命周期）→ Turn（一次用户输入到 agent 完成）→ Thread（持久化对话容器，支持 create/resume/fork/archive）。App Server 内部四组件：stdio reader → Codex message processor → thread manager → core threads。Web 端使用容器化部署，状态保存在服务端（标签页关闭不影响任务继续）。上下文相关：提到 "auto-compaction in Codex core" 作为服务端可独立升级的能力。
 https://openai.com/index/unlocking-the-codex-harness/
 
 **Building Production-Ready AI Agents: Codex CLI Architecture** — ZenML
 对 Codex CLI 架构的技术分析：Agent Loop 设计、Prompt 构建（instructions + tools + input）、SSE 流式响应、配置层级（$CODEX_HOME → 项目根目录 → 当前目录）、32KiB 指令限制。
 https://www.zenml.io/llmops-database/building-production-ready-ai-agents-openai-codex-cli-architecture-and-agent-loop-design
+
+**OpenAI Compaction API Guide** — OpenAI Developer Docs
+Codex 上下文压缩的官方 API 文档。两种实现方式：服务端压缩（设置 `compact_threshold` 后自动触发，返回加密的 opaque compaction item）和独立 Compact 端点（`/responses/compact`，无状态、ZDR 友好，接受完整上下文窗口返回压缩版本）。关键原则：standalone compact 的输出即权威的下一轮上下文窗口，不应再裁剪。
+https://developers.openai.com/docs/guides/compaction
+
+**Codex CLI GitHub Repository** — OpenAI
+Codex CLI 开源代码仓库（Rust）。核心上下文管理模块位于 `codex-rs/core/src/context_manager/`（history.rs、normalize.rs、updates.rs）、`codex-rs/core/src/compact.rs`（本地压缩）、`codex-rs/core/src/compact_remote.rs`（远端压缩）。BM25 tool_search 工具搜索、中间截断输出策略、上下文增量 diff 更新机制。两阶段 Memory Pipeline（rollout extraction + global consolidation）。
+https://github.com/openai/codex
+
+**Context Compaction Strategies: Comparative Analysis** — badlogic (GitHub Gist)
+Claude Code、Codex CLI、OpenCode、Amp 四款 Agent 的上下文压缩策略横向对比。关键发现：Claude Code 触发阈值约 95% 容量；Codex CLI 按 token 数触发（180k-244k），保留最近 20k tokens 的用户消息；OpenCode 用 prune 保护最近 40k tokens；Amp 完全不做自动压缩，靠 handoff/fork 手动控制。所有产品都承认多次压缩导致质量累积衰减。
+https://gist.github.com/badlogic/cd2ef65b0697c4dbe2d13fbecb0a0a5f
 
 ### 3. Anthropic 系列（Claude Code / Cowork 实践）
 
@@ -119,6 +131,32 @@ https://opencode.ai/
 https://github.com/anomalyco/opencode
 
 注：早期版本曾托管于 github.com/opencode-ai/opencode（Go + BubbleTea），2025年9月归档。当前版本已用 TypeScript 完全重写。
+
+**OpenCode Plugins Documentation** — OpenCode
+OpenCode Plugin 机制完整文档。Plugin 是 JS/TS 模块，通过导出函数返回 Hooks 实现。支持的 Hook 包括：tool.execute.before/after（工具调用拦截）、experimental.chat.system.transform（system prompt 改写）、experimental.chat.messages.transform（消息历史改写）、experimental.session.compacting（压缩时注入上下文）、shell.env（环境变量注入）、event（全局事件监听）、自定义 tool 定义等。Plugin 可从 npm 或本地 .opencode/plugins/ 加载。
+https://opencode.ai/docs/zh-cn/plugins/
+
+## 五、评估与观测相关
+
+**Evaluating Context Compression Strategies for Long-Running AI Agent Sessions** — Factory AI (2025.12)
+★ 高价值。Probe-based 评估框架：四类探针（recall/artifact/continuation/decision）×六维评分（准确性/上下文意识/工件追踪/完整性/连贯性/指令遵循）。36,000+ 条生产消息，GPT-5.2 盲测评分。Factory 结构化摘要（3.70）> Anthropic 内置压缩（3.44）> OpenAI compact 端点（3.35）。关键发现：65% 企业 AI 失败归因于 context drift 而非 context exhaustion。
+https://docs.factory.ai/guides/power-user/evaluating-context-compression
+
+**Two Experiments We Need to Run on AI Agent Compaction** — Jason Liu (2025.8)
+提出两个关键实验：（1）Compaction as Momentum——测试压缩时机对 Agent 工作"势头"的影响，在不同阈值（50%/75%/自然边界/Agent 自决）触发压缩，测量 backtracking 次数；（2）Trajectory Observability via Specialized Compaction——用领域特定的压缩 prompt 提取不同类型的故障模式（linter 循环、语言切换、用户反馈），再用 embedding 聚类发现群体模式。指出公开 benchmark 缺乏足够长的 Agent 轨迹。
+https://jxnl.co/writing/2025/08/30/context-engineering-compaction/
+
+**Beyond Black-Box Benchmarking: Observability, Analytics, and Optimization of Agentic Systems** — arXiv:2503.06745 (2025)
+首个针对 Agentic System 可观测性的系统方法论。扩展 OpenTelemetry 引入 GenAI Events（创建/更新/启动/结束/失败等）。三层分析：被动（自动指标汇总）→探索性（根因分析、跨轨迹对比）→干预性（配置调优、组件替换）。提出执行流图编辑距离等新指标。ABBench 数据集（30 条日志），TAMAS 系统 60% benchmark 与 ground truth 一致。
+https://arxiv.org/abs/2503.06745
+
+**AI Agent Observability - Evolving Standards and Best Practices** — OpenTelemetry (2025)
+OpenTelemetry GenAI SIG 的 AI Agent 语义约定标准化进展。两层约定：Agent Application Conventions（已定稿）和 Agent Framework Conventions（开发中）。两种插桩方式：内置（框架原生 emit）vs 外部 OTel 库。覆盖：Agent 执行模式、工具调用链、LLM 交互质量、VectorDB 操作。
+https://opentelemetry.io/blog/2025/ai-agent-observability/
+
+**Context-Bench: Benchmarking LLMs on Agentic Context Engineering** — Letta (2025.10)
+专注于长运行上下文能力的 benchmark，基于 Letta Evals 框架构建。测试 Agent 能否跨多步骤工作流维护、复用和推理上下文——链式文件操作、项目结构关系追踪、长对话一致性决策。追踪 memory 管理效率、上下文重访频率和任务完成成本。结果：Claude Sonnet 4.5 以 74.0%/$24.58 领先，GPT-5 72.67%/$43.56。排行榜：https://leaderboard.letta.com/
+https://www.letta.com/blog/context-bench
 
 **OpenCode vs Claude Code** — Builder.io
 OpenCode 与 Claude Code 的详细对比。
